@@ -1,0 +1,18 @@
+{
+  "name": "nvim-aware",
+  "metadata": {
+    "description": "Neovim awareness for AI coding agents — live editor context from a running Neovim session."
+  },
+  "owner": {
+    "name": "Anoop K. Chandran",
+    "email": "anoopkcn@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "nvim-aware-claude",
+      "source": "./hosts/claude",
+      "description": "Make Claude Code aware of a running Neovim session.",
+      "version": "0.2.0"
+    }
+  ]
+}

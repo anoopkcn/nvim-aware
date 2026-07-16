@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+/**
+ * claude-nvim — launch Claude Code pre-connected to a running Neovim session.
+ *
+ * Thin config over core/launcher.mjs: discovers the Neovim server (interactive
+ * picker when several are running), changes into that instance's cwd, exports
+ * NVIM_AWARE_SERVER so the plugin's hooks/MCP skip rediscovery, then execs `claude`.
+ *
+ * Wrapper flags (stripped before handing the rest to claude):
+ *   --nvim-server <addr>     pin a specific Neovim server address
+ *   --nvim-context <mode>    set NVIM_AWARE_PROMPT_CONTEXT (auto|full|hint|off)
+ *
+ * Symlink this onto your PATH (see README) and run `claude-nvim` instead of `claude`.
+ */
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { runLauncher } from "../core/launcher.mjs";
+import { errorToMessage, safeRealpath } from "../core/proc.mjs";
+
+// Load the bundled plugin on demand (mirrors pi-nvim's auto `-e <extension>`), so
+// nvim-awareness only happens when you go through this launcher. Skip when the user
+// already installs the plugin globally (set NVIM_AWARE_AUTO_PLUGIN_DIR=0).
+function autoPluginDirArgs() {
+	const flag = process.env.NVIM_AWARE_AUTO_PLUGIN_DIR;
+	if (flag === "0" || flag === "false") return [];
+	const scriptPath = safeRealpath(fileURLToPath(import.meta.url));
+	const pluginRoot = resolve(dirname(scriptPath), "..");
+	if (!existsSync(join(pluginRoot, ".claude-plugin", "plugin.json"))) return [];
+	return ["--plugin-dir", pluginRoot];
+}
+
+runLauncher({
+	name: "claude-nvim",
+	binaryName: "claude",
+	realBinaryEnvVar: "NVIM_AWARE_REAL_CLAUDE",
+	valueFlags: ["--nvim-context"],
+	buildArgs: ({ passthrough }) => [...autoPluginDirArgs(), ...passthrough],
+	buildEnv: ({ flags }) =>
+		flags["nvim-context"] ? { NVIM_AWARE_PROMPT_CONTEXT: flags["nvim-context"] } : {},
+}).catch((error) => {
+	console.error(`claude-nvim: ${errorToMessage(error)}`);
+	process.exit(1);
+});

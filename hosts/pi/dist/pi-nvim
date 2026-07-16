@@ -1,0 +1,487 @@
+#!/usr/bin/env node
+// GENERATED FILE — do not edit. Source: hosts/pi/bin/pi-nvim. Regenerate with `npm run build` (or `node scripts/build.mjs`).
+
+// hosts/pi/bin/.pi-nvim.entry.mjs
+import { existsSync } from "node:fs";
+import { dirname as dirname2, join as join3, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// core/launcher.mjs
+import { spawn as spawn2 } from "node:child_process";
+import { accessSync, constants } from "node:fs";
+import { stat } from "node:fs/promises";
+import { basename, dirname, join as join2, relative as relative2 } from "node:path";
+import { createInterface } from "node:readline";
+
+// core/discover.mjs
+import { lstat, readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// core/proc.mjs
+import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { relative } from "node:path";
+var DEFAULT_TIMEOUT_MS = 2e3;
+function runProcess(command, args, options = {}) {
+  return new Promise((resolveProcess, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = [];
+    const stderr = [];
+    let settled = false;
+    const timeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const timer = timeout > 0 ? setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGTERM");
+      reject(new Error(`${command} timed out after ${timeout}ms`));
+    }, timeout) : void 0;
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolveProcess({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        code
+      });
+    });
+  });
+}
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex++;
+        results[index] = await mapper(items[index], index);
+      }
+    })
+  );
+  return results;
+}
+function parseFirstJsonObject(text) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+function uniqueStrings(values) {
+  return [...new Set(values.map((value) => value?.trim()).filter((value) => Boolean(value)))];
+}
+function uniqueExistingRealpaths(values) {
+  const roots = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const value of uniqueStrings(values)) {
+    const real = safeRealpath(value);
+    if (seen.has(real)) continue;
+    seen.add(real);
+    roots.push(value);
+  }
+  return roots;
+}
+function isInside(parent, child) {
+  if (!parent || !child) return false;
+  const rel = relative(parent, child);
+  return rel === "" || !rel.startsWith("..") && !rel.startsWith("/");
+}
+function vimSingleQuoted(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+function safeRealpath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+function errorToMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// core/snapshot.mjs
+function makeServerSummaryExpression() {
+  const lua = String.raw`
+(function()
+  local api = vim.api
+  local fn = vim.fn
+  local cursor = api.nvim_win_get_cursor(0)
+  return fn.json_encode({
+    cwd = fn.getcwd(),
+    currentFile = api.nvim_buf_get_name(0),
+    cursor = { line = cursor[1], column = cursor[2] + 1 },
+  })
+end)()
+`;
+  return `luaeval(${vimSingleQuoted(lua)})`;
+}
+async function getNvimServerSummary(server, options = {}) {
+  const result = await runProcess("nvim", ["--server", server, "--remote-expr", makeServerSummaryExpression()], {
+    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  });
+  if (result.code !== 0) {
+    throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
+  }
+  const json = result.stdout.trim() || result.stderr.trim();
+  if (!json) throw new Error("Neovim returned an empty server summary");
+  const summary = JSON.parse(json);
+  return { ...summary, server };
+}
+
+// core/discover.mjs
+var PROBE_CONCURRENCY = 4;
+var DEFAULT_PROBE_TIMEOUT_MS = 1200;
+async function listServersFromNvim() {
+  try {
+    const result = await runProcess(
+      "nvim",
+      [
+        "--headless",
+        "--clean",
+        "-n",
+        "+echo json_encode({'self': v:servername, 'servers': serverlist()})",
+        "+qa"
+      ],
+      { timeoutMs: 1500 }
+    );
+    const parsed = parseFirstJsonObject(result.stdout + result.stderr);
+    if (!parsed?.servers || !Array.isArray(parsed.servers)) return [];
+    return parsed.servers.filter((server) => typeof server === "string" && server && server !== parsed.self);
+  } catch {
+    return [];
+  }
+}
+async function scanNvimSocketFiles() {
+  if (process.platform === "win32") return [];
+  const roots = uniqueExistingRealpaths([process.env.XDG_RUNTIME_DIR, process.env.TMPDIR, tmpdir(), "/tmp"]);
+  const sockets = [];
+  const seen = /* @__PURE__ */ new Set();
+  const maxSockets = 3e3;
+  const addSocket = (path) => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    sockets.push(path);
+  };
+  const walk = async (dir, depth, inNvimishDir) => {
+    if (depth < 0 || sockets.length >= maxSockets) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (sockets.length >= maxSockets) return;
+      const path = join(dir, entry.name);
+      const pathLower = path.toLowerCase();
+      const nameIsNvimish = entry.name.toLowerCase().includes("nvim");
+      const pathIsNvimish = inNvimishDir || nameIsNvimish || pathLower.includes("nvim");
+      if (entry.isSocket?.()) {
+        if (pathIsNvimish) addSocket(path);
+        continue;
+      }
+      if (!entry.isDirectory()) {
+        if (!pathIsNvimish) continue;
+        try {
+          if ((await lstat(path)).isSocket()) addSocket(path);
+        } catch {
+        }
+        continue;
+      }
+      if (depth === 0) continue;
+      if (pathIsNvimish) {
+        await walk(path, depth - 1, true);
+      }
+    }
+  };
+  for (const root of roots) {
+    await walk(root, 5, false);
+  }
+  return sockets;
+}
+async function fastCandidates(explicit) {
+  if (explicit) return [explicit];
+  return uniqueStrings([
+    process.env.NVIM,
+    process.env.NVIM_LISTEN_ADDRESS,
+    ...await listServersFromNvim()
+  ]);
+}
+async function probeSummaries(candidates, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+  return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (server) => {
+    try {
+      return { server, summary: await getNvimServerSummary(server, { timeoutMs }) };
+    } catch (error) {
+      return { server, error: errorToMessage(error) };
+    }
+  });
+}
+function chooseBestNvimServer(items, cwd) {
+  const best = items.find((item) => item.cwd === cwd) ?? items.find((item) => isInside(cwd, item.currentFile)) ?? items.find((item) => isInside(item.cwd, cwd)) ?? items[0];
+  if (!best) throw new Error("No Neovim server candidates responded");
+  return best;
+}
+async function collectServerSummaries(options = {}) {
+  const explicit = options.explicit;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+  const fast = await fastCandidates(explicit);
+  let results = fast.length > 0 ? await probeSummaries(fast, { timeoutMs }) : [];
+  let summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
+  if (!explicit && summaries.length === 0) {
+    const scanned = uniqueStrings((await scanNvimSocketFiles()).filter((s) => !fast.includes(s)));
+    if (scanned.length > 0) {
+      results = [...results, ...await probeSummaries(scanned, { timeoutMs })];
+      summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
+    }
+  }
+  const failures = results.flatMap((r) => r.error ? [`${r.server}: ${r.error}`] : []);
+  return { summaries, failures, candidateCount: summaries.length };
+}
+
+// core/launcher.mjs
+async function runLauncher(config, argv = process.argv.slice(2)) {
+  const launchCwd = process.cwd();
+  const parsed = parseWrapperArgs(argv, config.valueFlags ?? []);
+  let selected;
+  try {
+    selected = await selectNvimServer({
+      name: config.name,
+      explicitServer: parsed.explicitServer,
+      launchCwd
+    });
+  } catch (error) {
+    console.error(`${config.name}: ${errorToMessage(error)}`);
+  }
+  if (selected?.cwd && await isDirectory(selected.cwd)) {
+    process.chdir(selected.cwd);
+    console.error(`${config.name}: connected to ${basename(selected.cwd) || selected.cwd} (${selected.server})`);
+  } else if (selected?.server) {
+    console.error(`${config.name}: connected to ${selected.server}; staying in ${launchCwd}`);
+  } else {
+    console.error(`${config.name}: no Neovim server selected; starting ${config.binaryName} in the terminal cwd`);
+  }
+  const context = {
+    passthrough: parsed.passthrough,
+    flags: parsed.flags,
+    selected,
+    explicitServer: parsed.explicitServer
+  };
+  const realBinary = findRealBinary(config);
+  const child = spawn2(realBinary, config.buildArgs(context), {
+    cwd: process.cwd(),
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      ...selected?.server ? { NVIM_AWARE_SERVER: selected.server } : {},
+      ...config.buildEnv?.(context) ?? {}
+    }
+  });
+  child.on("error", (error) => {
+    console.error(`${config.name}: failed to start ${realBinary}: ${error.message}`);
+    process.exit(1);
+  });
+  child.on("exit", (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code ?? 1);
+  });
+}
+function parseWrapperArgs(args, valueFlags) {
+  const passthrough = [];
+  const flags = {};
+  let explicitServer;
+  outer: for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--nvim") continue;
+    if (arg.startsWith("--nvim=")) {
+      explicitServer = arg.slice("--nvim=".length);
+      continue;
+    }
+    if (arg === "--nvim-server") {
+      explicitServer = requireValue(args, ++i, "--nvim-server");
+      continue;
+    }
+    if (arg.startsWith("--nvim-server=")) {
+      explicitServer = arg.slice("--nvim-server=".length);
+      continue;
+    }
+    for (const flag of valueFlags) {
+      if (arg === flag) {
+        flags[flag.replace(/^--/, "")] = requireValue(args, ++i, flag);
+        continue outer;
+      }
+      if (arg.startsWith(`${flag}=`)) {
+        flags[flag.replace(/^--/, "")] = arg.slice(flag.length + 1);
+        continue outer;
+      }
+    }
+    passthrough.push(arg);
+  }
+  return { passthrough, flags, explicitServer };
+}
+function requireValue(args, index, name) {
+  const value = args[index];
+  if (!value || value.startsWith("-")) throw new Error(`${name} requires a value`);
+  return value;
+}
+async function selectNvimServer({ name, explicitServer, launchCwd }) {
+  const { summaries, failures } = await collectServerSummaries({ explicit: explicitServer });
+  if (summaries.length === 0) {
+    if (explicitServer) {
+      console.error(`${name}: ${explicitServer} did not respond; staying in ${launchCwd}`);
+    } else if (failures.length > 0) {
+      console.error(`${name}: found Neovim candidates, but none responded; staying in ${launchCwd}`);
+    }
+    return explicitServer ? { server: explicitServer, cwd: void 0 } : void 0;
+  }
+  if (explicitServer) {
+    return summaries.find((summary) => summary.server === explicitServer) ?? summaries[0];
+  }
+  if (summaries.length === 1) {
+    return summaries[0];
+  }
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    return promptForServer(summaries, launchCwd);
+  }
+  const selected = chooseBestNvimServer(summaries, launchCwd);
+  console.error(
+    `${name}: found ${summaries.length} Neovim instances; selected ${basename(selected.cwd) || selected.cwd}. Pass --nvim-server to choose explicitly.`
+  );
+  return selected;
+}
+function promptForServer(summaries, launchCwd) {
+  return new Promise((resolveChoice) => {
+    const defaultSummary = chooseBestNvimServer(summaries, launchCwd);
+    const defaultIndex = Math.max(0, summaries.indexOf(defaultSummary));
+    const labels = labelledDirNames(summaries);
+    const labelWidth = Math.max(...labels.map((label) => label.length));
+    process.stdout.write("\nMultiple Neovim instances found.\n\n");
+    summaries.forEach((summary, index) => {
+      const marker = index === defaultIndex ? "*" : " ";
+      const indexText = `${index + 1})`.padStart(String(summaries.length).length + 1, " ");
+      process.stdout.write(`${marker} ${indexText} ${labels[index].padEnd(labelWidth)}  ${summary.cwd}  ${fileDisplay(summary)}
+`);
+    });
+    process.stdout.write("\n");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const ask = () => {
+      rl.question(`Connect to Neovim instance [1-${summaries.length}] (default ${defaultIndex + 1}): `, (answer) => {
+        const trimmed = answer.trim();
+        if (!trimmed) {
+          rl.close();
+          resolveChoice(defaultSummary);
+          return;
+        }
+        const index = Number.parseInt(trimmed, 10);
+        if (Number.isInteger(index) && index >= 1 && index <= summaries.length) {
+          rl.close();
+          resolveChoice(summaries[index - 1]);
+          return;
+        }
+        process.stdout.write(`Please enter a number from 1 to ${summaries.length}.
+`);
+        ask();
+      });
+    };
+    ask();
+  });
+}
+function labelledDirNames(summaries) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const summary of summaries) {
+    const name = basename(summary.cwd) || summary.cwd;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return summaries.map((summary) => {
+    const name = basename(summary.cwd) || summary.cwd;
+    if ((counts.get(name) ?? 0) <= 1) return name;
+    const parent = basename(dirname(summary.cwd));
+    return parent ? `${parent}/${name}` : name;
+  });
+}
+function fileDisplay(summary) {
+  if (!summary.currentFile) return "[No Name]";
+  const rel = relative2(summary.cwd, summary.currentFile);
+  const file = rel && !rel.startsWith("..") && !rel.startsWith("/") ? rel : summary.currentFile;
+  return summary.cursor?.line > 0 ? `${file}:${summary.cursor.line}` : file;
+}
+function findRealBinary(config) {
+  const pinned = process.env[config.realBinaryEnvVar];
+  if (pinned) return pinned;
+  const current = safeRealpath(process.argv[1]);
+  const names = process.platform === "win32" ? [`${config.binaryName}.cmd`, `${config.binaryName}.exe`, config.binaryName] : [config.binaryName];
+  for (const dir of (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":")) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = join2(dir, name);
+      if (!isExecutable(candidate)) continue;
+      if (safeRealpath(candidate) === current) continue;
+      return candidate;
+    }
+  }
+  return config.binaryName;
+}
+async function isDirectory(path) {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function isExecutable(path) {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// hosts/pi/bin/.pi-nvim.entry.mjs
+function autoExtensionArgs() {
+  const flag = process.env.NVIM_AWARE_AUTO_EXTENSION;
+  if (flag === "0" || flag === "false") return [];
+  const scriptDir = dirname2(safeRealpath(fileURLToPath(import.meta.url)));
+  const candidates = [
+    join3(scriptDir, "nvim-aware-pi.ts"),
+    // bundled dist copy: extension sits alongside
+    resolve(scriptDir, "..", "dist", "nvim-aware-pi.ts")
+    // repo checkout: bin/ next to dist/
+  ];
+  const extensionPath = candidates.find((candidate) => existsSync(candidate));
+  return extensionPath ? ["-e", extensionPath] : [];
+}
+runLauncher({
+  name: "pi-nvim",
+  binaryName: "pi",
+  realBinaryEnvVar: "NVIM_AWARE_REAL_PI",
+  buildArgs: ({ passthrough, selected, explicitServer }) => {
+    const server = selected?.server ?? explicitServer;
+    return [
+      ...autoExtensionArgs(),
+      "--nvim",
+      ...server ? ["--nvim-server", server] : [],
+      ...passthrough
+    ];
+  }
+}).catch((error) => {
+  console.error(`pi-nvim: ${errorToMessage(error)}`);
+  process.exit(1);
+});

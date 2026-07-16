@@ -1,0 +1,49 @@
+#!/usr/bin/env node
+/**
+ * pi-nvim — launch Pi pre-connected to a running Neovim session.
+ *
+ * Thin config over core/launcher.mjs: discovers the Neovim server (interactive
+ * picker when several are running), changes into that instance's cwd, then
+ * execs `pi` with `--nvim`, the resolved `--nvim-server`, and the bundled
+ * extension auto-loaded via `-e`.
+ *
+ * Symlink this onto your PATH (see README) and run `pi-nvim` instead of `pi`.
+ */
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { runLauncher } from "../../../core/launcher.mjs";
+import { errorToMessage, safeRealpath } from "../../../core/proc.mjs";
+
+// Auto-load the extension so nvim-awareness works without a global install.
+// Set NVIM_AWARE_AUTO_EXTENSION=0 to skip, e.g. when the extension is
+// installed in ~/.pi/agent/extensions.
+function autoExtensionArgs() {
+	const flag = process.env.NVIM_AWARE_AUTO_EXTENSION;
+	if (flag === "0" || flag === "false") return [];
+	const scriptDir = dirname(safeRealpath(fileURLToPath(import.meta.url)));
+	const candidates = [
+		join(scriptDir, "nvim-aware-pi.ts"), // bundled dist copy: extension sits alongside
+		resolve(scriptDir, "..", "dist", "nvim-aware-pi.ts"), // repo checkout: bin/ next to dist/
+	];
+	const extensionPath = candidates.find((candidate) => existsSync(candidate));
+	return extensionPath ? ["-e", extensionPath] : [];
+}
+
+runLauncher({
+	name: "pi-nvim",
+	binaryName: "pi",
+	realBinaryEnvVar: "NVIM_AWARE_REAL_PI",
+	buildArgs: ({ passthrough, selected, explicitServer }) => {
+		const server = selected?.server ?? explicitServer;
+		return [
+			...autoExtensionArgs(),
+			"--nvim",
+			...(server ? ["--nvim-server", server] : []),
+			...passthrough,
+		];
+	},
+}).catch((error) => {
+	console.error(`pi-nvim: ${errorToMessage(error)}`);
+	process.exit(1);
+});
