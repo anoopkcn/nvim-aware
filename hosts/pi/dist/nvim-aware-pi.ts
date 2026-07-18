@@ -104,8 +104,8 @@ function safeRealpath(path) {
 function errorToMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
-function readEnvMs(name, fallback) {
-  const raw = process.env[name];
+function readEnvMs(env, name, fallback) {
+  const raw = env[name];
   if (!raw) return fallback;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
@@ -114,15 +114,38 @@ function asNonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : void 0;
 }
 
+// core/injection.mjs
+var NONE = Object.freeze({ kind: "none" });
+var HINT = Object.freeze({ kind: "hint" });
+var SNAPSHOT = Object.freeze({ kind: "snapshot" });
+
 // core/config.mjs
+var CONFIG_DEFAULTS = Object.freeze({
+  promptContextMode: "auto",
+  snapshotTtlMs: 750,
+  promptTimeoutMs: 800
+});
+var VALID_PROMPT_CONTEXT_MODES = /* @__PURE__ */ new Set(["auto", "full", "hint", "off"]);
+var FALSY = /* @__PURE__ */ new Set(["0", "false", "no"]);
+function readConfig(env = process.env) {
+  const mode = asNonEmptyString(env.NVIM_AWARE_PROMPT_CONTEXT)?.toLowerCase();
+  const disable = asNonEmptyString(env.NVIM_AWARE_DISABLE)?.toLowerCase();
+  return Object.freeze({
+    server: asNonEmptyString(env.NVIM_AWARE_SERVER),
+    promptContextMode: mode && VALID_PROMPT_CONTEXT_MODES.has(mode) ? mode : CONFIG_DEFAULTS.promptContextMode,
+    snapshotTtlMs: readEnvMs(env, "NVIM_AWARE_SNAPSHOT_TTL_MS", CONFIG_DEFAULTS.snapshotTtlMs),
+    promptTimeoutMs: readEnvMs(env, "NVIM_AWARE_PROMPT_TIMEOUT_MS", CONFIG_DEFAULTS.promptTimeoutMs),
+    disabled: disable !== void 0 && !FALSY.has(disable)
+  });
+}
 function getExplicitServer() {
-  return asNonEmptyString(process.env.NVIM_AWARE_SERVER);
+  return readConfig().server;
 }
 function getSnapshotTtlMs() {
-  return readEnvMs("NVIM_AWARE_SNAPSHOT_TTL_MS", 750);
+  return readConfig().snapshotTtlMs;
 }
 function getPromptRefreshTimeoutMs() {
-  return readEnvMs("NVIM_AWARE_PROMPT_TIMEOUT_MS", 800);
+  return readConfig().promptTimeoutMs;
 }
 
 // core/snapshot-lua.mjs

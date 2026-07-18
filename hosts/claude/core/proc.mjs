@@ -137,8 +137,8 @@ export function errorToMessage(error) {
 }
 
 /** Read a non-negative millisecond value from an env var, falling back if unset/invalid. */
-export function readEnvMs(name, fallback) {
-	const raw = process.env[name];
+export function readEnvMs(env, name, fallback) {
+	const raw = env[name];
 	if (!raw) return fallback;
 	const value = Number(raw);
 	return Number.isFinite(value) && value >= 0 ? value : fallback;

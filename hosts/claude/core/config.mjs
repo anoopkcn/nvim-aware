@@ -1,6 +1,9 @@
 // GENERATED FILE — do not edit. Source: core/config.mjs. Regenerate with `npm run build` (or `node scripts/build.mjs`).
 /**
- * Configuration + prompt heuristics.
+ * Configuration, read from the environment as a value.
+ *
+ * A value rather than a set of getters so policy can be exercised without
+ * mutating process.env, and so a turn sees one consistent reading.
  *
  * Environment variables:
  *   NVIM_AWARE_SERVER             explicit Neovim server address to pin
@@ -11,48 +14,57 @@
  */
 import { asNonEmptyString, readEnvMs } from "./proc.mjs";
 
-const DEFAULT_PROMPT_CONTEXT_MODE = "auto";
+export const CONFIG_DEFAULTS = Object.freeze({
+	promptContextMode: "auto",
+	snapshotTtlMs: 750,
+	promptTimeoutMs: 800,
+});
+
 const VALID_PROMPT_CONTEXT_MODES = new Set(["auto", "full", "hint", "off"]);
 
-/** Resolve the prompt-context mode from the environment. */
-export function getPromptContextMode() {
-	const value = asNonEmptyString(process.env.NVIM_AWARE_PROMPT_CONTEXT)?.toLowerCase() ?? DEFAULT_PROMPT_CONTEXT_MODE;
-	return VALID_PROMPT_CONTEXT_MODES.has(value) ? value : DEFAULT_PROMPT_CONTEXT_MODE;
-}
-
-/** The explicit server address, if pinned via env. */
-export function getExplicitServer() {
-	return asNonEmptyString(process.env.NVIM_AWARE_SERVER);
-}
-
-/** Snapshot cache TTL for long-lived hosts. */
-export function getSnapshotTtlMs() {
-	return readEnvMs("NVIM_AWARE_SNAPSHOT_TTL_MS", 750);
-}
-
-/** Refresh timeout for prompt-time snapshots. */
-export function getPromptRefreshTimeoutMs() {
-	return readEnvMs("NVIM_AWARE_PROMPT_TIMEOUT_MS", 800);
-}
-
-/** Master kill switch for context injection. */
-export function isDisabled() {
-	const value = asNonEmptyString(process.env.NVIM_AWARE_DISABLE)?.toLowerCase();
-	return value !== undefined && value !== "0" && value !== "false" && value !== "no";
-}
+/** Falsy spellings that mean "not disabled" rather than "disabled". */
+const FALSY = new Set(["0", "false", "no"]);
 
 /**
- * Decide whether a user's prompt looks like it depends on live editor state.
+ * @returns {Readonly<{server: string|undefined, promptContextMode: "auto"|"full"|"hint"|"off",
+ *                     snapshotTtlMs: number, promptTimeoutMs: number, disabled: boolean}>}
  */
-export function promptLikelyNeedsNvimContext(prompt) {
-	const text = String(prompt ?? "").toLowerCase();
-	return [
-		/\b(neovim|nvim)\b/,
-		/\b(current|open|active)\s+(file|buffer|window|tab)\b/,
-		/\b(this|that|these|those)\s+(files?|buffers?|code|functions?|class(?:es)?|methods?|selections?|snippets?|lines?)\b/,
-		/\b(selected|selection|visual selection|highlighted)\b/,
-		/\b(cursor|under cursor|around here|right here|line under|current line)\b/,
-		/\b(quickfix|qflist|quickfix list|diagnostics?|errors?|warnings?|lint|linter|compiler|build failure)\b/,
-		/\b(search register|last search|open buffers?|listed buffers?|visible windows?)\b/,
-	].some((pattern) => pattern.test(text));
+export function readConfig(env = process.env) {
+	const mode = asNonEmptyString(env.NVIM_AWARE_PROMPT_CONTEXT)?.toLowerCase();
+	const disable = asNonEmptyString(env.NVIM_AWARE_DISABLE)?.toLowerCase();
+
+	return Object.freeze({
+		server: asNonEmptyString(env.NVIM_AWARE_SERVER),
+		promptContextMode: mode && VALID_PROMPT_CONTEXT_MODES.has(mode) ? mode : CONFIG_DEFAULTS.promptContextMode,
+		snapshotTtlMs: readEnvMs(env, "NVIM_AWARE_SNAPSHOT_TTL_MS", CONFIG_DEFAULTS.snapshotTtlMs),
+		promptTimeoutMs: readEnvMs(env, "NVIM_AWARE_PROMPT_TIMEOUT_MS", CONFIG_DEFAULTS.promptTimeoutMs),
+		disabled: disable !== undefined && !FALSY.has(disable),
+	});
 }
+
+// ---------------------------------------------------------------------------
+// Superseded by readConfig + core/injection.mjs. Kept so the hosts keep running
+// until they are rewritten; removed with the last call site.
+// ---------------------------------------------------------------------------
+
+export function getPromptContextMode() {
+	return readConfig().promptContextMode;
+}
+
+export function getExplicitServer() {
+	return readConfig().server;
+}
+
+export function getSnapshotTtlMs() {
+	return readConfig().snapshotTtlMs;
+}
+
+export function getPromptRefreshTimeoutMs() {
+	return readConfig().promptTimeoutMs;
+}
+
+export function isDisabled() {
+	return readConfig().disabled;
+}
+
+export { promptLikelyNeedsNvimContext } from "./injection.mjs";
