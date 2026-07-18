@@ -66,8 +66,14 @@ const outputs = new Map();
 
 // 1. Vendored core for the Claude plugin (marketplace installs copy only the
 //    plugin directory, so the plugin must carry its own copy of core).
+//
+//    Only `.mjs` files are vendored, and `*.test.mjs` is excluded. Anything core
+//    imports at runtime must therefore be a non-test `.mjs` — a sibling asset in
+//    another format would not be copied, and the plugin would fail at runtime.
+const isCoreModule = (name) => name.endsWith(".mjs") && !name.endsWith(".test.mjs");
+
 const coreDir = join(repoRoot, "core");
-for (const name of (await readdir(coreDir)).filter((entry) => entry.endsWith(".mjs")).sort()) {
+for (const name of (await readdir(coreDir)).filter(isCoreModule).sort()) {
 	const content = await readFile(join(coreDir, name), "utf8");
 	outputs.set(join(repoRoot, "hosts/claude/core", name), {
 		content: `${banner(`core/${name}`)}\n${content}`,

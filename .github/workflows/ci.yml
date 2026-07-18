@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Runs `build.mjs --check` first: the Claude host executes the vendored
+      # copy under hosts/claude/core/, so committed artifacts drifting from
+      # core/ is a real failure, not a formatting nit.
+      - run: npm test
