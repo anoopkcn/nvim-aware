@@ -682,65 +682,81 @@ function createSpawnTransport({ run = runProcess, env = process.env, platform = 
   };
 }
 
-// core/discover.mjs
+// core/discovery.mjs
 var PROBE_CONCURRENCY = 4;
 var DEFAULT_PROBE_TIMEOUT_MS = 1200;
-async function fastCandidates(explicit, transport, env) {
-  if (explicit) return [explicit];
-  return uniqueStrings([env.NVIM, env.NVIM_LISTEN_ADDRESS, ...await transport.listServers()]);
+function chooseBestNvimServer(candidates, cwd) {
+  return candidates.find((item) => item.cwd === cwd) ?? candidates.find((item) => isInside(cwd, item.currentFile)) ?? candidates.find((item) => isInside(item.cwd, cwd)) ?? candidates[0];
 }
-async function probeSummaries(candidates, { transport, timeoutMs }) {
-  return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (server) => {
-    try {
-      const raw = await transport.evaluate(server, summaryRequest(), { timeoutMs });
-      return { server, summary: toSummary(raw, { server }) };
-    } catch (error) {
-      return { server, error: errorToMessage(error) };
-    }
-  });
-}
-function chooseBestNvimServer(items, cwd) {
-  const best = items.find((item) => item.cwd === cwd) ?? items.find((item) => isInside(cwd, item.currentFile)) ?? items.find((item) => isInside(item.cwd, cwd)) ?? items[0];
-  if (!best) throw new Error("No Neovim server candidates responded");
-  return best;
-}
-async function collectServerSummaries(options = {}) {
-  const transport = options.transport ?? createSpawnTransport();
-  const env = options.env ?? process.env;
-  const explicit = options.explicit;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  const fast = await fastCandidates(explicit, transport, env);
-  let results = fast.length > 0 ? await probeSummaries(fast, { transport, timeoutMs }) : [];
-  let summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
-  if (!explicit && summaries.length === 0) {
-    const scanned = uniqueStrings((await transport.scanSocketFiles()).filter((s) => !fast.includes(s)));
-    if (scanned.length > 0) {
-      results = [...results, ...await probeSummaries(scanned, { transport, timeoutMs })];
-      summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
-    }
+function describeDiscoveryFailure({ failures }) {
+  if (failures.length > 0) {
+    return `Found Neovim server candidates, but none responded. ${failures.join("; ")}`;
   }
-  const failures = results.flatMap((r) => r.error ? [`${r.server}: ${r.error}`] : []);
-  return { summaries, failures, candidateCount: summaries.length };
+  return "No Neovim server found. Start Neovim normally, or run `nvim --listen /tmp/nvim-main` and set NVIM_AWARE_SERVER=/tmp/nvim-main.";
 }
+function createDiscovery({ transport = createSpawnTransport(), env = process.env } = {}) {
+  function tagged(entries) {
+    const seen = /* @__PURE__ */ new Set();
+    const list = [];
+    for (const [server, source] of entries) {
+      const address = server?.trim();
+      if (!address || seen.has(address)) continue;
+      seen.add(address);
+      list.push({ server: address, source });
+    }
+    return list;
+  }
+  async function probe(candidates, timeoutMs) {
+    return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (candidate) => {
+      try {
+        const raw = await transport.evaluate(candidate.server, summaryRequest(), { timeoutMs });
+        return { ok: { ...candidate, ...toSummary(raw, { server: candidate.server }), probed: true } };
+      } catch (error) {
+        return { failure: `${candidate.server}: ${errorToMessage(error)}` };
+      }
+    });
+  }
+  async function discover({ explicit, cwd = process.cwd(), timeoutMs = DEFAULT_PROBE_TIMEOUT_MS, probeExplicit = true } = {}) {
+    if (explicit && !probeExplicit) {
+      const candidate = { server: explicit, source: "explicit", probed: false };
+      return { candidates: [candidate], failures: [], best: candidate, source: "explicit" };
+    }
+    const fast = explicit ? tagged([[explicit, "explicit"]]) : tagged([
+      [env.NVIM, "env"],
+      [env.NVIM_LISTEN_ADDRESS, "env"],
+      ...(await transport.listServers()).map((server) => [server, "serverlist"])
+    ]);
+    let results = fast.length > 0 ? await probe(fast, timeoutMs) : [];
+    let candidates = results.flatMap((r) => r.ok ? [r.ok] : []);
+    if (!explicit && candidates.length === 0) {
+      const known = new Set(fast.map((c) => c.server));
+      const scanned = tagged((await transport.scanSocketFiles()).filter((s) => !known.has(s)).map((s) => [s, "scan"]));
+      if (scanned.length > 0) {
+        results = [...results, ...await probe(scanned, timeoutMs)];
+        candidates = results.flatMap((r) => r.ok ? [r.ok] : []);
+      }
+    }
+    const failures = results.flatMap((r) => r.failure ? [r.failure] : []);
+    const best = chooseBestNvimServer(candidates, cwd);
+    return { candidates, failures, best: best ?? null, source: best?.source ?? "none" };
+  }
+  return { discover };
+}
+async function resolveNvimServer(options = {}) {
+  const discovery = options.discovery ?? createDiscovery({ transport: options.transport, env: options.env });
+  const result = await discovery.discover({
+    explicit: options.explicit,
+    cwd: options.cwd,
+    timeoutMs: options.timeoutMs,
+    probeExplicit: options.probeExplicit ?? false
+  });
+  if (!result.best) throw new Error(describeDiscoveryFailure(result));
+  return { server: result.best.server, summary: result.best, candidateCount: result.candidates.length, source: result.source };
+}
+
+// core/discover.mjs
 async function resolveServer(options = {}) {
-  const explicit = options.explicit;
-  if (explicit) return { server: explicit, candidateCount: 1 };
-  const cwd = options.cwd ?? process.cwd();
-  const { summaries, failures, candidateCount } = await collectServerSummaries({
-    transport: options.transport,
-    env: options.env,
-    timeoutMs: options.timeoutMs
-  });
-  if (summaries.length === 0) {
-    if (failures.length > 0) {
-      throw new Error(`Found Neovim server candidates, but none responded. ${failures.join("; ")}`);
-    }
-    throw new Error(
-      "No Neovim server found. Start Neovim normally, or run `nvim --listen /tmp/nvim-main` and set NVIM_AWARE_SERVER=/tmp/nvim-main."
-    );
-  }
-  const best = chooseBestNvimServer(summaries, cwd);
-  return { server: best.server, summary: best, candidateCount };
+  return resolveNvimServer({ ...options, probeExplicit: false });
 }
 
 // core/format.mjs

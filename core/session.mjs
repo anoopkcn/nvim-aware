@@ -11,7 +11,7 @@
  * de-duplication, stale fallback, and a bounded cache.
  */
 import { errorToMessage } from "./proc.mjs";
-import { resolveServer } from "./discover.mjs";
+import { resolveNvimServer } from "./discovery.mjs";
 import { limitsKey, normalizeLimits, snapshotRequest, SnapshotShapeError, toSnapshot } from "./snapshot.mjs";
 import { createSpawnTransport } from "./transport.mjs";
 
@@ -44,7 +44,7 @@ export function createNvimSession({
 	rediscoverBackoffMs = DEFAULT_REDISCOVER_BACKOFF_MS,
 	now = Date.now,
 } = {}) {
-	const resolveConnection = resolve ?? ((input) => resolveServer({ explicit: input.explicit, cwd: input.cwd }));
+	const resolveConnection = resolve ?? ((input) => resolveNvimServer({ ...input, transport }));
 	const currentCwd = () => (typeof cwd === "function" ? cwd() : cwd);
 
 	/** @type {Promise<{server: string, candidateCount: number}> | null} */
