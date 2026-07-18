@@ -13,7 +13,7 @@ import { createNvimSession } from "../core/session.mjs";
 import { LIMIT_DEFAULTS } from "../core/snapshot.mjs";
 import { formatSnapshot } from "../core/format.mjs";
 
-const SERVER_INFO = { name: "nvim-aware", version: "0.2.0" };
+const SERVER_INFO = { name: "nvim-aware", version: "0.3.0" };
 const PROTOCOL_VERSION = "2024-11-05";
 
 const TOOL = {

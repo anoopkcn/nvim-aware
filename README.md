@@ -79,6 +79,9 @@ cp hosts/pi/dist/nvim-aware-pi.ts ~/.pi/agent/extensions/nvim-aware-pi.ts
 export NVIM_AWARE_AUTO_EXTENSION=0   # extension is global now; don't load it twice
 ```
 
+Those copies are self-contained, so they keep running the version you copied. Re-copy
+both files after updating the repo to pick up changes.
+
 ## Keep typing `claude` / `pi`
 
 Prefer opting in with a flag instead of a separate command? Add a shell function to your
@@ -110,7 +113,8 @@ pattern works for `pi` with `pi-nvim`.
 
 ## Configuration
 
-All configuration is via environment variables, shared by both hosts:
+All configuration is via environment variables. Both hosts share one decision, so these
+mean the same thing under Claude Code and Pi:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -119,6 +123,11 @@ All configuration is via environment variables, shared by both hosts:
 | `NVIM_AWARE_SNAPSHOT_TTL_MS` | `750` | Snapshot cache TTL in long-lived hosts. |
 | `NVIM_AWARE_PROMPT_TIMEOUT_MS` | `800` | Refresh timeout for prompt-time snapshots. |
 | `NVIM_AWARE_DISABLE` | _(unset)_ | Any truthy value disables all context injection. |
+
+Under `auto`, a prompt that does not reach for the editor injects nothing. Pi used to
+inject on every turn regardless; if you prefer that, set
+`NVIM_AWARE_PROMPT_CONTEXT=full`. The `/nvim` command and the `nvim_context` tool keep
+working in every mode — an explicit request is not automatic injection.
 
 Host-specific: `NVIM_AWARE_AUTO_PLUGIN_DIR=0` / `NVIM_AWARE_AUTO_EXTENSION=0` stop the
 launchers auto-loading the plugin/extension (for global installs);
@@ -129,12 +138,16 @@ cannot find it on `PATH`.
 
 ```
 core/                     single source of truth (plain ESM, zero runtime deps)
-  proc.mjs                process exec, timeouts, bounded concurrency, small utils
-  config.mjs              env config + prompt heuristics
-  discover.mjs            server discovery: env -> serverlist() -> socket scan; cwd matching
-  snapshot.mjs            Lua snapshot expression, fetch, TTL cache, cached fallback
+  transport.mjs           the seam: everything that spawns or touches the filesystem
+  discovery.mjs           which instance? env -> serverlist() -> socket scan; cwd matching
+  snapshot-lua.mjs        the Lua evaluated inside Neovim
+  snapshot.mjs            the snapshot contract: build a request, parse and normalize
+  session.mjs             a connection: resolution, caching, invalidation, stale fallback
+  injection.mjs           whether a turn gets editor state, and how much
+  config.mjs              the environment, read as a value
   format.mjs              compact / full snapshot rendering
   launcher.mjs            generic "launch a CLI pre-connected to Neovim" engine
+  proc.mjs                process exec, timeouts, bounded concurrency, small utils
 
 hosts/claude/             the Claude Code plugin (self-contained)
   hooks/  mcp/  commands/ bin/   host glue: hooks, MCP server, /nvim, launcher config
@@ -146,7 +159,16 @@ hosts/pi/                 the Pi integration
   dist/                   GENERATED — single-file bundles for distribution
 
 scripts/build.mjs         materializes core into the host artifacts
+test/                     node:test suite, no dependencies
 ```
+
+Hosts do not assemble these themselves. They open a **session** and ask it for a
+snapshot, and ask **injection** whether this turn warrants one. Both hosts obey the same
+decision, so `NVIM_AWARE_PROMPT_CONTEXT` and `NVIM_AWARE_DISABLE` behave identically
+under Claude Code and Pi.
+
+Everything that spawns a process or reads the filesystem goes through the transport, so
+the rest of `core/` is exercisable without a running editor.
 
 Both hosts require **self-contained artifacts**: a Claude marketplace install copies
 only `hosts/claude/`, and the Pi extension supports single-file copy-install. The build
@@ -160,7 +182,11 @@ Edit `core/` or the host sources, then regenerate the artifacts:
 ```bash
 npm run build     # or: node scripts/build.mjs
 npm run check     # exit 1 if committed artifacts are out of sync (for CI / pre-commit)
+npm test          # the drift check, then the test suite
 ```
+
+`npm test` runs `--check` first on purpose: the Claude host executes the *vendored* copy
+under `hosts/claude/core/`, so a forgotten rebuild means debugging code you did not edit.
 
 Bundling needs an `esbuild` binary, resolved from `$ESBUILD`, `node_modules/.bin`
 (`npm install`), `tools/esbuild` (drop a standalone binary there), or `PATH`.

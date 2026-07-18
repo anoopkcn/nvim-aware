@@ -13,10 +13,11 @@ generated single-file bundles for distribution (do not edit them; run the repo b
 
 ## What Pi learns
 
-When started through the wrapper, Pi gets Neovim context before each agent turn. The
-extension keeps a very short snapshot cache to avoid redundant `nvim --remote-expr` calls
-during rapid turns, and falls back to the last known snapshot if Neovim is briefly slow
-or unavailable:
+When started through the wrapper, Pi gets Neovim context on turns whose prompt reaches
+for the editor (see [Injection modes](#injection-modes) to change that). The extension
+keeps a very short snapshot cache to avoid redundant `nvim --remote-expr` calls during
+rapid turns, and falls back to the last known snapshot if Neovim is briefly slow or
+unavailable:
 
 - Neovim cwd
 - current file
@@ -124,11 +125,25 @@ The env vars are shared with the other nvim-aware hosts.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
+| `NVIM_AWARE_PROMPT_CONTEXT` | `auto` | How much state to inject per turn: `auto`, `full`, `hint`, or `off`. |
 | `NVIM_AWARE_SERVER` | _(discovered)_ | Pin a specific Neovim server address; skips discovery. |
 | `NVIM_AWARE_SNAPSHOT_TTL_MS` | `750` | Prompt-time snapshot cache TTL. |
 | `NVIM_AWARE_PROMPT_TIMEOUT_MS` | `800` | Cached-refresh timeout for prompt-time snapshots. |
+| `NVIM_AWARE_DISABLE` | _(unset)_ | Any truthy value disables injection and withdraws the tool. |
 | `NVIM_AWARE_REAL_PI` | _(from `PATH`)_ | Path to the real Pi binary if the wrapper cannot find it. |
 | `NVIM_AWARE_AUTO_EXTENSION` | _(unset)_ | Set to `0` to stop the wrapper auto-loading the bundled extension. |
+
+### Injection modes
+
+- **`auto`** (default) — inject a compact snapshot only when the prompt reaches for the
+  editor ("this file", "the selection", "the quickfix list"). Neutral prompts cost nothing.
+- **`full`** — inject a compact snapshot before every turn.
+- **`hint`** — never inject state; just remind the agent that `nvim_context` exists.
+- **`off`** — inject nothing.
+
+Before 0.3.0 this extension ignored `NVIM_AWARE_PROMPT_CONTEXT` and always behaved as
+`full`. Set `NVIM_AWARE_PROMPT_CONTEXT=full` to keep that behaviour. `/nvim` and the
+`nvim_context` tool work in every mode — an explicit request is not automatic injection.
 
 ## Notes
 

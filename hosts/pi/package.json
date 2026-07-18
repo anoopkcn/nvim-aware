@@ -1,14 +1,21 @@
 {
   "name": "nvim-aware-pi",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Lightweight Pi extension that makes Pi aware of a running Neovim session.",
-  "keywords": ["pi-package", "pi", "neovim", "nvim"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "neovim",
+    "nvim"
+  ],
   "license": "MIT",
   "bin": {
     "pi-nvim": "./dist/pi-nvim"
   },
   "pi": {
-    "extensions": ["./dist/nvim-aware-pi.ts"]
+    "extensions": [
+      "./dist/nvim-aware-pi.ts"
+    ]
   }
 }
