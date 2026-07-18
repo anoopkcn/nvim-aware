@@ -87,6 +87,13 @@ function isInside(parent, child) {
 function vimSingleQuoted(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
+function vimNumberDict(values) {
+  const entries = Object.entries(values).map(([key, value]) => {
+    if (!Number.isFinite(value)) throw new Error(`vimNumberDict: ${key} is not a finite number`);
+    return `${vimSingleQuoted(key)}: ${value}`;
+  });
+  return `{${entries.join(", ")}}`;
+}
 function safeRealpath(path) {
   try {
     return realpathSync(path);
@@ -136,15 +143,14 @@ var SUMMARY_LUA = String.raw`
   })
 end)()
 `;
-function makeSnapshotLua(limits) {
-  return String.raw`
+var SNAPSHOT_LUA = String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
-  local surrounding = ${limits.surroundingLines}
-  local max_selection_bytes = ${limits.maxSelectionBytes}
-  local max_buffers = ${limits.maxBuffers}
-  local max_quickfix_items = ${limits.maxQuickfixItems}
+  local surrounding = _A.surroundingLines
+  local max_selection_bytes = _A.maxSelectionBytes
+  local max_buffers = _A.maxBuffers
+  local max_quickfix_items = _A.maxQuickfixItems
   local visual_block = string.char(22)
   local select_block = string.char(19)
   local newline = string.char(10)
@@ -432,7 +438,6 @@ function makeSnapshotLua(limits) {
   })
 end)()
 `;
-}
 
 // core/snapshot.mjs
 var LIMIT_DEFAULTS = Object.freeze({
@@ -467,16 +472,10 @@ function normalizeLimits(limits = {}) {
 function limitsKey(limits) {
   return `${limits.surroundingLines}:${limits.maxSelectionBytes}:${limits.maxBuffers}:${limits.maxQuickfixItems}`;
 }
-var expressionCache = /* @__PURE__ */ new Map();
+var SNAPSHOT_LUA_QUOTED = vimSingleQuoted(SNAPSHOT_LUA);
 function snapshotRequest(limits) {
   const normalized = normalizeLimits(limits);
-  const key = limitsKey(normalized);
-  let expression = expressionCache.get(key);
-  if (!expression) {
-    expression = `luaeval(${vimSingleQuoted(makeSnapshotLua(normalized))})`;
-    expressionCache.set(key, expression);
-  }
-  return { kind: "snapshot", expression };
+  return { kind: "snapshot", expression: `luaeval(${SNAPSHOT_LUA_QUOTED}, ${vimNumberDict(normalized)})` };
 }
 function summaryRequest() {
   return { kind: "summary", expression: `luaeval(${vimSingleQuoted(SUMMARY_LUA)})` };

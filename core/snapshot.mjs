@@ -6,8 +6,8 @@
  * snapshot, so the shape every renderer depends on is guaranteed in one place
  * rather than assumed at each field access.
  */
-import { makeSnapshotLua, SUMMARY_LUA } from "./snapshot-lua.mjs";
-import { errorToMessage, runProcess, vimSingleQuoted, DEFAULT_TIMEOUT_MS } from "./proc.mjs";
+import { SNAPSHOT_LUA, SUMMARY_LUA } from "./snapshot-lua.mjs";
+import { errorToMessage, runProcess, vimNumberDict, vimSingleQuoted, DEFAULT_TIMEOUT_MS } from "./proc.mjs";
 
 export const LIMIT_DEFAULTS = Object.freeze({
 	surroundingLines: 5,
@@ -54,18 +54,13 @@ export function limitsKey(limits) {
 	return `${limits.surroundingLines}:${limits.maxSelectionBytes}:${limits.maxBuffers}:${limits.maxQuickfixItems}`;
 }
 
-const expressionCache = new Map();
+// The Lua is static, so this is built once and the limits ride as arguments.
+const SNAPSHOT_LUA_QUOTED = vimSingleQuoted(SNAPSHOT_LUA);
 
 /** @returns {{kind: "snapshot", expression: string}} */
 export function snapshotRequest(limits) {
 	const normalized = normalizeLimits(limits);
-	const key = limitsKey(normalized);
-	let expression = expressionCache.get(key);
-	if (!expression) {
-		expression = `luaeval(${vimSingleQuoted(makeSnapshotLua(normalized))})`;
-		expressionCache.set(key, expression);
-	}
-	return { kind: "snapshot", expression };
+	return { kind: "snapshot", expression: `luaeval(${SNAPSHOT_LUA_QUOTED}, ${vimNumberDict(normalized)})` };
 }
 
 /** @returns {{kind: "summary", expression: string}} */

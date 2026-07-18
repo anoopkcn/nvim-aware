@@ -96,8 +96,16 @@ test("requests are tagged and carry a luaeval expression", () => {
 	assert.equal(summaryRequest().kind, "summary");
 });
 
-test("limits reach the Lua", () => {
-	assert.match(snapshotRequest({ maxBuffers: 7 }).expression, /local max_buffers = 7/);
+test("limits ride as luaeval arguments, not as interpolated Lua", () => {
+	const expression = snapshotRequest({ maxBuffers: 7 }).expression;
+	assert.match(expression, /'maxBuffers': 7/);
+	assert.match(expression, /local max_buffers = _A\.maxBuffers/);
+});
+
+test("the Lua expression is identical across different limits", () => {
+	// One static chunk; only the argument dict varies.
+	const lua = (limits) => snapshotRequest(limits).expression.split("', {")[0];
+	assert.equal(lua({ maxBuffers: 7 }), lua({ maxBuffers: 99, surroundingLines: 0 }));
 });
 
 test("quickfix is queried with idx=0", () => {

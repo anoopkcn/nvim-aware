@@ -112,6 +112,18 @@ export function vimSingleQuoted(value) {
 	return `'${value.replaceAll("'", "''")}'`;
 }
 
+/**
+ * Render a flat object of finite numbers as a Vim dict literal.
+ * Numbers only — enough for luaeval arguments, and nothing to escape.
+ */
+export function vimNumberDict(values) {
+	const entries = Object.entries(values).map(([key, value]) => {
+		if (!Number.isFinite(value)) throw new Error(`vimNumberDict: ${key} is not a finite number`);
+		return `${vimSingleQuoted(key)}: ${value}`;
+	});
+	return `{${entries.join(", ")}}`;
+}
+
 export function safeRealpath(path) {
 	try {
 		return realpathSync(path);

@@ -30,16 +30,18 @@ export const SUMMARY_LUA = String.raw`
 end)()
 `;
 
-/** Full snapshot, parametrized by the given limits. */
-export function makeSnapshotLua(limits) {
-	return String.raw`
+/**
+ * Full snapshot. Static: the limits arrive in _A, luaeval's second argument,
+ * so there is one expression rather than one per combination of limits.
+ */
+export const SNAPSHOT_LUA = String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
-  local surrounding = ${limits.surroundingLines}
-  local max_selection_bytes = ${limits.maxSelectionBytes}
-  local max_buffers = ${limits.maxBuffers}
-  local max_quickfix_items = ${limits.maxQuickfixItems}
+  local surrounding = _A.surroundingLines
+  local max_selection_bytes = _A.maxSelectionBytes
+  local max_buffers = _A.maxBuffers
+  local max_quickfix_items = _A.maxQuickfixItems
   local visual_block = string.char(22)
   local select_block = string.char(19)
   local newline = string.char(10)
@@ -327,4 +329,3 @@ export function makeSnapshotLua(limits) {
   })
 end)()
 `;
-}
