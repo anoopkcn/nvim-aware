@@ -113,9 +113,8 @@ function errorToMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-// core/snapshot.mjs
-function makeServerSummaryExpression() {
-  const lua = String.raw`
+// core/snapshot-lua.mjs
+var SUMMARY_LUA = String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
@@ -127,19 +126,64 @@ function makeServerSummaryExpression() {
   })
 end)()
 `;
-  return `luaeval(${vimSingleQuoted(lua)})`;
+
+// core/snapshot.mjs
+var LIMIT_DEFAULTS = Object.freeze({
+  surroundingLines: 5,
+  maxSelectionBytes: 4e3,
+  maxBuffers: 30,
+  maxQuickfixItems: 30
+});
+var DEFAULT_SURROUNDING_LINES = LIMIT_DEFAULTS.surroundingLines;
+var DEFAULT_MAX_SELECTION_BYTES = LIMIT_DEFAULTS.maxSelectionBytes;
+var DEFAULT_MAX_BUFFERS = LIMIT_DEFAULTS.maxBuffers;
+var DEFAULT_MAX_QUICKFIX_ITEMS = LIMIT_DEFAULTS.maxQuickfixItems;
+var SnapshotShapeError = class extends Error {
+  constructor(message, { raw } = {}) {
+    super(message);
+    this.name = "SnapshotShapeError";
+    if (raw !== void 0) this.raw = excerpt(raw);
+  }
+};
+function excerpt(text, max = 200) {
+  const value = String(text);
+  return value.length <= max ? value : `${value.slice(0, max)}\u2026`;
 }
-async function getNvimServerSummary(server, options = {}) {
-  const result = await runProcess("nvim", ["--server", server, "--remote-expr", makeServerSummaryExpression()], {
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  });
+function summaryRequest() {
+  return { kind: "summary", expression: `luaeval(${vimSingleQuoted(SUMMARY_LUA)})` };
+}
+function parseJson(raw, what) {
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new SnapshotShapeError(`Neovim returned an empty ${what}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new SnapshotShapeError(`Neovim returned unparseable ${what} JSON: ${errorToMessage(error)}`, { raw });
+  }
+}
+function asPosition(value) {
+  return { line: Number(value?.line ?? 0), column: Number(value?.column ?? 0) };
+}
+function toSummary(raw, { server }) {
+  const parsed = parseJson(raw, "server summary");
+  return {
+    server,
+    cwd: parsed.cwd ?? "",
+    currentFile: parsed.currentFile ?? "",
+    cursor: asPosition(parsed.cursor)
+  };
+}
+async function evaluate(server, request, timeoutMs) {
+  const result = await runProcess("nvim", ["--server", server, "--remote-expr", request.expression], { timeoutMs });
   if (result.code !== 0) {
     throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
   }
-  const json = result.stdout.trim() || result.stderr.trim();
-  if (!json) throw new Error("Neovim returned an empty server summary");
-  const summary = JSON.parse(json);
-  return { ...summary, server };
+  return result.stdout.trim() || result.stderr.trim();
+}
+async function getNvimServerSummary(server, options = {}) {
+  const raw = await evaluate(server, summaryRequest(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  return toSummary(raw, { server });
 }
 
 // core/discover.mjs

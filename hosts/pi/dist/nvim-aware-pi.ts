@@ -123,36 +123,8 @@ import { lstat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// core/snapshot.mjs
-var DEFAULT_SURROUNDING_LINES = 5;
-var DEFAULT_MAX_SELECTION_BYTES = 4e3;
-var DEFAULT_MAX_BUFFERS = 30;
-var DEFAULT_MAX_QUICKFIX_ITEMS = 30;
-var snapshotExpressionCache = /* @__PURE__ */ new Map();
-var snapshotCache = /* @__PURE__ */ new Map();
-var snapshotInFlight = /* @__PURE__ */ new Map();
-function normalizeSnapshotOptions(options = {}) {
-  return {
-    surroundingLines: Math.max(0, Math.floor(options.surroundingLines ?? DEFAULT_SURROUNDING_LINES)),
-    maxSelectionBytes: Math.max(0, Math.floor(options.maxSelectionBytes ?? DEFAULT_MAX_SELECTION_BYTES)),
-    maxBuffers: Math.max(1, Math.floor(options.maxBuffers ?? DEFAULT_MAX_BUFFERS)),
-    maxQuickfixItems: Math.max(0, Math.floor(options.maxQuickfixItems ?? DEFAULT_MAX_QUICKFIX_ITEMS))
-  };
-}
-function snapshotOptionsKey(options) {
-  return `${options.surroundingLines}:${options.maxSelectionBytes}:${options.maxBuffers}:${options.maxQuickfixItems}`;
-}
-function snapshotCacheKey(server, options) {
-  return `${server}\0${snapshotOptionsKey(options)}`;
-}
-function rememberSnapshot(snapshot, options) {
-  snapshotCache.set(snapshotCacheKey(snapshot.server, options), { snapshot, createdAt: Date.now() });
-}
-function cachedSnapshotEntry(server, options) {
-  return snapshotCache.get(snapshotCacheKey(server, normalizeSnapshotOptions(options)));
-}
-function makeServerSummaryExpression() {
-  const lua = String.raw`
+// core/snapshot-lua.mjs
+var SUMMARY_LUA = String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
@@ -164,20 +136,15 @@ function makeServerSummaryExpression() {
   })
 end)()
 `;
-  return `luaeval(${vimSingleQuoted(lua)})`;
-}
-function makeSnapshotExpression(options) {
-  const cacheKey = snapshotOptionsKey(options);
-  const cached = snapshotExpressionCache.get(cacheKey);
-  if (cached) return cached;
-  const lua = String.raw`
+function makeSnapshotLua(limits) {
+  return String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
-  local surrounding = ${options.surroundingLines}
-  local max_selection_bytes = ${options.maxSelectionBytes}
-  local max_buffers = ${options.maxBuffers}
-  local max_quickfix_items = ${options.maxQuickfixItems}
+  local surrounding = ${limits.surroundingLines}
+  local max_selection_bytes = ${limits.maxSelectionBytes}
+  local max_buffers = ${limits.maxBuffers}
+  local max_quickfix_items = ${limits.maxQuickfixItems}
   local visual_block = string.char(22)
   local select_block = string.char(19)
   local newline = string.char(10)
@@ -377,7 +344,10 @@ function makeSnapshotExpression(options) {
   local function read_quickfix()
     if max_quickfix_items <= 0 then return nil end
 
-    local ok_qf, qf = pcall(fn.getqflist, { title = 1, idx = 1, size = 1, items = 1 })
+    -- idx MUST be 0, not 1. Asking for a specific index narrows the returned
+    -- items to that single entry, which silently reduced every quickfix list
+    -- to one item. idx=0 reports the current index and returns the whole list.
+    local ok_qf, qf = pcall(fn.getqflist, { title = 1, idx = 0, size = 1, items = 1 })
     if not ok_qf or type(qf) ~= 'table' then return nil end
 
     local all_items = qf.items or {}
@@ -462,68 +432,156 @@ function makeSnapshotExpression(options) {
   })
 end)()
 `;
-  const expr = `luaeval(${vimSingleQuoted(lua)})`;
-  snapshotExpressionCache.set(cacheKey, expr);
-  return expr;
+}
+
+// core/snapshot.mjs
+var LIMIT_DEFAULTS = Object.freeze({
+  surroundingLines: 5,
+  maxSelectionBytes: 4e3,
+  maxBuffers: 30,
+  maxQuickfixItems: 30
+});
+var DEFAULT_SURROUNDING_LINES = LIMIT_DEFAULTS.surroundingLines;
+var DEFAULT_MAX_SELECTION_BYTES = LIMIT_DEFAULTS.maxSelectionBytes;
+var DEFAULT_MAX_BUFFERS = LIMIT_DEFAULTS.maxBuffers;
+var DEFAULT_MAX_QUICKFIX_ITEMS = LIMIT_DEFAULTS.maxQuickfixItems;
+var SnapshotShapeError = class extends Error {
+  constructor(message, { raw } = {}) {
+    super(message);
+    this.name = "SnapshotShapeError";
+    if (raw !== void 0) this.raw = excerpt(raw);
+  }
+};
+function excerpt(text, max = 200) {
+  const value = String(text);
+  return value.length <= max ? value : `${value.slice(0, max)}\u2026`;
+}
+function normalizeLimits(limits = {}) {
+  return {
+    surroundingLines: Math.max(0, Math.floor(limits.surroundingLines ?? LIMIT_DEFAULTS.surroundingLines)),
+    maxSelectionBytes: Math.max(0, Math.floor(limits.maxSelectionBytes ?? LIMIT_DEFAULTS.maxSelectionBytes)),
+    maxBuffers: Math.max(1, Math.floor(limits.maxBuffers ?? LIMIT_DEFAULTS.maxBuffers)),
+    maxQuickfixItems: Math.max(0, Math.floor(limits.maxQuickfixItems ?? LIMIT_DEFAULTS.maxQuickfixItems))
+  };
+}
+function limitsKey(limits) {
+  return `${limits.surroundingLines}:${limits.maxSelectionBytes}:${limits.maxBuffers}:${limits.maxQuickfixItems}`;
+}
+var expressionCache = /* @__PURE__ */ new Map();
+function snapshotRequest(limits) {
+  const normalized = normalizeLimits(limits);
+  const key = limitsKey(normalized);
+  let expression = expressionCache.get(key);
+  if (!expression) {
+    expression = `luaeval(${vimSingleQuoted(makeSnapshotLua(normalized))})`;
+    expressionCache.set(key, expression);
+  }
+  return { kind: "snapshot", expression };
+}
+function summaryRequest() {
+  return { kind: "summary", expression: `luaeval(${vimSingleQuoted(SUMMARY_LUA)})` };
+}
+function parseJson(raw, what) {
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new SnapshotShapeError(`Neovim returned an empty ${what}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new SnapshotShapeError(`Neovim returned unparseable ${what} JSON: ${errorToMessage(error)}`, { raw });
+  }
+}
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return Object.values(value);
+  return [];
+}
+function asPosition(value) {
+  return { line: Number(value?.line ?? 0), column: Number(value?.column ?? 0) };
+}
+function toSnapshot(raw, { server }) {
+  const parsed = parseJson(raw, "snapshot");
+  if (!parsed.currentBuffer || typeof parsed.currentBuffer !== "object") {
+    throw new SnapshotShapeError("snapshot is missing currentBuffer", { raw });
+  }
+  if (!parsed.cursor || typeof parsed.cursor !== "object") {
+    throw new SnapshotShapeError("snapshot is missing cursor", { raw });
+  }
+  const quickfix = parsed.quickfix ? { ...parsed.quickfix, items: asArray(parsed.quickfix.items), size: Number(parsed.quickfix.size ?? 0) } : null;
+  return {
+    server,
+    cwd: parsed.cwd ?? "",
+    mode: parsed.mode ?? "",
+    currentFile: parsed.currentFile ?? "",
+    currentBuffer: parsed.currentBuffer,
+    cursor: { ...asPosition(parsed.cursor), lineText: parsed.cursor.lineText ?? "" },
+    // Lua drops nil keys entirely, so absence is normal, not a defect.
+    selection: parsed.selection ?? null,
+    search: parsed.search ?? "",
+    quickfix,
+    surroundingLines: asArray(parsed.surroundingLines),
+    buffers: asArray(parsed.buffers),
+    windows: asArray(parsed.windows)
+  };
+}
+function toSummary(raw, { server }) {
+  const parsed = parseJson(raw, "server summary");
+  return {
+    server,
+    cwd: parsed.cwd ?? "",
+    currentFile: parsed.currentFile ?? "",
+    cursor: asPosition(parsed.cursor)
+  };
+}
+var snapshotCache = /* @__PURE__ */ new Map();
+var snapshotInFlight = /* @__PURE__ */ new Map();
+function cacheKey(server, limits) {
+  return `${server}\0${limitsKey(limits)}`;
+}
+async function evaluate(server, request, timeoutMs) {
+  const result = await runProcess("nvim", ["--server", server, "--remote-expr", request.expression], { timeoutMs });
+  if (result.code !== 0) {
+    throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
+  }
+  return result.stdout.trim() || result.stderr.trim();
 }
 async function getNvimSnapshot(server, options = {}) {
-  const normalized = normalizeSnapshotOptions(options);
-  const expr = makeSnapshotExpression(normalized);
-  const result = await runProcess("nvim", ["--server", server, "--remote-expr", expr], {
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  });
-  if (result.code !== 0) {
-    throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
-  }
-  const json = result.stdout.trim() || result.stderr.trim();
-  if (!json) throw new Error("Neovim returned an empty snapshot");
-  const snapshot = JSON.parse(json);
-  return { ...snapshot, server };
+  const limits = normalizeLimits(options);
+  const raw = await evaluate(server, snapshotRequest(limits), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  return toSnapshot(raw, { server });
 }
 async function getNvimServerSummary(server, options = {}) {
-  const result = await runProcess("nvim", ["--server", server, "--remote-expr", makeServerSummaryExpression()], {
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  });
-  if (result.code !== 0) {
-    throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
-  }
-  const json = result.stdout.trim() || result.stderr.trim();
-  if (!json) throw new Error("Neovim returned an empty server summary");
-  const summary = JSON.parse(json);
-  return { ...summary, server };
+  const raw = await evaluate(server, summaryRequest(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  return toSummary(raw, { server });
 }
 async function getCachedNvimSnapshot(server, options = {}, cacheOptions = {}) {
-  const normalized = normalizeSnapshotOptions(options);
-  const cacheKey = snapshotCacheKey(server, normalized);
-  const now = Date.now();
-  const cached = snapshotCache.get(cacheKey);
+  const limits = normalizeLimits(options);
+  const key = cacheKey(server, limits);
   const ttlMs = cacheOptions.ttlMs ?? 0;
-  if (!cacheOptions.force && ttlMs > 0 && cached && now - cached.createdAt <= ttlMs) {
+  const cached = snapshotCache.get(key);
+  if (!cacheOptions.force && ttlMs > 0 && cached && Date.now() - cached.createdAt <= ttlMs) {
     return cached.snapshot;
   }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const requestKey = `${cacheKey}\0${timeoutMs}`;
+  const requestKey = `${key}\0${timeoutMs}`;
   const inFlight = snapshotInFlight.get(requestKey);
   if (inFlight) return inFlight;
-  const promise = getNvimSnapshot(server, { ...normalized, timeoutMs }).then((snapshot) => {
-    rememberSnapshot(snapshot, normalized);
+  const promise = getNvimSnapshot(server, { ...limits, timeoutMs }).then((snapshot) => {
+    snapshotCache.set(key, { snapshot, createdAt: Date.now() });
     return snapshot;
-  }).finally(() => {
-    snapshotInFlight.delete(requestKey);
-  });
+  }).finally(() => snapshotInFlight.delete(requestKey));
   snapshotInFlight.set(requestKey, promise);
   return promise;
 }
 async function getPromptNvimSnapshot(server, { ttlMs, refreshTimeoutMs, options = {} }) {
-  const normalized = normalizeSnapshotOptions(options);
-  const cached = cachedSnapshotEntry(server, normalized);
+  const limits = normalizeLimits(options);
+  const cached = snapshotCache.get(cacheKey(server, limits));
   if (cached && Date.now() - cached.createdAt <= ttlMs) {
     return { snapshot: cached.snapshot };
   }
   const timeoutMs = cached ? refreshTimeoutMs : DEFAULT_TIMEOUT_MS;
   try {
-    const snapshot = await getCachedNvimSnapshot(server, { ...normalized, timeoutMs }, { force: true });
-    return { snapshot };
+    return { snapshot: await getCachedNvimSnapshot(server, { ...limits, timeoutMs }, { force: true }) };
   } catch (error) {
     if (cached) return { snapshot: cached.snapshot, warning: errorToMessage(error) };
     throw error;
