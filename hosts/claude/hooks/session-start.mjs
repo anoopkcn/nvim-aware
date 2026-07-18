@@ -4,39 +4,41 @@
  * so Claude knows the `nvim_context` tool is available. In `full` mode it
  * preloads a snapshot.
  */
-import { getExplicitServer, getPromptContextMode, isDisabled } from "../core/config.mjs";
-import { resolveServer } from "../core/discover.mjs";
-import { getNvimSnapshot } from "../core/snapshot.mjs";
+import { readConfig } from "../core/config.mjs";
+import { decideSessionInjection } from "../core/injection.mjs";
+import { createNvimSession } from "../core/session.mjs";
 import { formatOnDemandSystemPromptContext, formatSystemPromptContext } from "../core/format.mjs";
 import { emitContext, readHookInput } from "../lib/hookio.mjs";
 
 const EVENT = "SessionStart";
 
 async function main() {
-	if (isDisabled()) return;
-
-	const mode = getPromptContextMode();
-	if (mode === "off") return;
+	const config = readConfig();
+	const decision = decideSessionInjection({ config });
+	if (decision.kind === "none") return;
 
 	const input = await readHookInput();
-	const cwd = input.cwd || process.cwd();
-	const explicit = getExplicitServer();
+	const session = createNvimSession({
+		explicitServer: config.server,
+		cwd: input.cwd || process.cwd(),
+		defaultTimeoutMs: 1500,
+	});
 
 	let server;
 	try {
-		({ server } = await resolveServer({ explicit, cwd }));
+		server = await session.server();
 	} catch {
 		// No Neovim running — nothing to announce.
 		return;
 	}
 
-	if (mode === "full") {
+	if (decision.kind === "snapshot") {
 		try {
-			const snapshot = await getNvimSnapshot(server, { timeoutMs: 1500 });
-			emitContext(EVENT, formatSystemPromptContext(snapshot));
+			emitContext(EVENT, formatSystemPromptContext(await session.snapshot()));
 			return;
 		} catch {
-			// Fall through to the lightweight reminder.
+			// Connected but unreadable: degrading to the reminder is a host
+			// recovery choice, not part of the shared decision.
 		}
 	}
 

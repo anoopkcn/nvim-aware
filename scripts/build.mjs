@@ -66,8 +66,14 @@ const outputs = new Map();
 
 // 1. Vendored core for the Claude plugin (marketplace installs copy only the
 //    plugin directory, so the plugin must carry its own copy of core).
+//
+//    Only `.mjs` files are vendored, and `*.test.mjs` is excluded. Anything core
+//    imports at runtime must therefore be a non-test `.mjs` — a sibling asset in
+//    another format would not be copied, and the plugin would fail at runtime.
+const isCoreModule = (name) => name.endsWith(".mjs") && !name.endsWith(".test.mjs");
+
 const coreDir = join(repoRoot, "core");
-for (const name of (await readdir(coreDir)).filter((entry) => entry.endsWith(".mjs")).sort()) {
+for (const name of (await readdir(coreDir)).filter(isCoreModule).sort()) {
 	const content = await readFile(join(coreDir, name), "utf8");
 	outputs.set(join(repoRoot, "hosts/claude/core", name), {
 		content: `${banner(`core/${name}`)}\n${content}`,
@@ -100,7 +106,28 @@ try {
 	await rm(wrapperEntry, { force: true });
 }
 
+// Deleting a module from core/ must delete its vendored copy too. Without this
+// the orphan lingers in the plugin, and --check would call the tree in sync
+// because it only ever compares files the build still generates.
+const vendoredCoreDir = join(repoRoot, "hosts/claude/core");
+const orphans = (await readdir(vendoredCoreDir).catch(() => []))
+	.filter((name) => name.endsWith(".mjs"))
+	.map((name) => join(vendoredCoreDir, name))
+	.filter((target) => !outputs.has(target));
+
 let drift = 0;
+
+for (const target of orphans) {
+	const label = relative(repoRoot, target);
+	if (checkOnly) {
+		console.error(`orphaned: ${label}`);
+		drift++;
+		continue;
+	}
+	await rm(target);
+	console.log(`removed ${label}`);
+}
+
 for (const [target, { content, executable }] of outputs) {
 	const label = relative(repoRoot, target);
 	const existing = await readFile(target, "utf8").catch(() => null);

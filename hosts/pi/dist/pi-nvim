@@ -13,11 +13,6 @@ import { stat } from "node:fs/promises";
 import { basename, dirname, join as join2, relative as relative2 } from "node:path";
 import { createInterface } from "node:readline";
 
-// core/discover.mjs
-import { lstat, readdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 // core/proc.mjs
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
@@ -113,9 +108,8 @@ function errorToMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-// core/snapshot.mjs
-function makeServerSummaryExpression() {
-  const lua = String.raw`
+// core/snapshot-lua.mjs
+var SUMMARY_LUA = String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
@@ -127,130 +121,485 @@ function makeServerSummaryExpression() {
   })
 end)()
 `;
-  return `luaeval(${vimSingleQuoted(lua)})`;
-}
-async function getNvimServerSummary(server, options = {}) {
-  const result = await runProcess("nvim", ["--server", server, "--remote-expr", makeServerSummaryExpression()], {
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  });
-  if (result.code !== 0) {
-    throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
+var SNAPSHOT_LUA = String.raw`
+(function()
+  local api = vim.api
+  local fn = vim.fn
+  local surrounding = _A.surroundingLines
+  local max_selection_bytes = _A.maxSelectionBytes
+  local max_buffers = _A.maxBuffers
+  local max_quickfix_items = _A.maxQuickfixItems
+  local visual_block = string.char(22)
+  local select_block = string.char(19)
+  local newline = string.char(10)
+
+  local function bool(v) return v == true or v == 1 end
+
+  local function mode_is_visual(m)
+    return m == 'v' or m == 'V' or m == visual_block or m == 's' or m == 'S' or m == select_block
+  end
+
+  local function pos(line, col)
+    return { line = line or 0, column = col or 0 }
+  end
+
+  local function normalize(a, b)
+    local a_line, a_col = a[2] or 0, a[3] or 0
+    local b_line, b_col = b[2] or 0, b[3] or 0
+    if a_line > b_line or (a_line == b_line and a_col > b_col) then
+      return b, a
+    end
+    return a, b
+  end
+
+  local function slice_line(line_text, start_col, end_col)
+    if start_col < 1 then start_col = 1 end
+    local len = #line_text
+    if end_col < 1 or end_col > len then end_col = len end
+    if start_col > len then return '' end
+    if end_col < start_col then return '' end
+    return string.sub(line_text, start_col, end_col)
+  end
+
+  local function truncate_text(text, max_bytes)
+    if max_bytes <= 0 then return '', #text > 0 end
+    if #text <= max_bytes then return text, false end
+    return string.sub(text, 1, max_bytes) .. newline .. '…[selection truncated]', true
+  end
+
+  local function read_selection(current_mode)
+    local active = mode_is_visual(current_mode)
+    local selection_mode = active and current_mode or fn.visualmode()
+    local raw_start = active and fn.getpos('v') or fn.getpos([=['<]=])
+    local raw_end = active and fn.getpos('.') or fn.getpos([=['>]=])
+    local start_pos, end_pos = normalize(raw_start, raw_end)
+    local start_line, start_col = start_pos[2] or 0, start_pos[3] or 0
+    local end_line, end_col = end_pos[2] or 0, end_pos[3] or 0
+
+    if start_line <= 0 or end_line <= 0 then return nil end
+
+    local ok, lines = pcall(api.nvim_buf_get_lines, 0, start_line - 1, end_line, false)
+    if not ok or not lines or #lines == 0 then return nil end
+
+    if selection_mode == 'V' then
+      -- Keep complete selected lines.
+    elseif selection_mode == visual_block or selection_mode == select_block then
+      local left = math.min(start_col, end_col)
+      local right = math.max(start_col, end_col)
+      for i, line_text in ipairs(lines) do
+        lines[i] = slice_line(line_text, left, right)
+      end
+    else
+      if #lines == 1 then
+        lines[1] = slice_line(lines[1], start_col, end_col)
+      else
+        lines[1] = slice_line(lines[1], start_col, #lines[1])
+        lines[#lines] = slice_line(lines[#lines], 1, end_col)
+      end
+    end
+
+    local text, truncated = truncate_text(table.concat(lines, newline), max_selection_bytes)
+    return {
+      active = active,
+      mode = selection_mode,
+      start = pos(start_line, start_col),
+      ['end'] = pos(end_line, end_col),
+      text = text,
+      truncated = truncated,
+    }
+  end
+
+  local buffer_cache = {}
+
+  local function buffer_name(bufnr)
+    local cached_info = buffer_cache[bufnr]
+    if cached_info and cached_info.name then return cached_info.name end
+    local ok_name, name = pcall(api.nvim_buf_get_name, bufnr)
+    return ok_name and name or ''
+  end
+
+  local function buffer_info(bufnr)
+    local cached_info = buffer_cache[bufnr]
+    if cached_info then return cached_info end
+
+    local loaded = api.nvim_buf_is_loaded(bufnr)
+    local line_count = 0
+    if loaded then
+      local ok_count, count = pcall(api.nvim_buf_line_count, bufnr)
+      line_count = ok_count and count or 0
+    end
+
+    local filetype = ''
+    if loaded then
+      local ok_ft, ft = pcall(function() return vim.bo[bufnr].filetype end)
+      filetype = ok_ft and ft or ''
+    end
+
+    local ok_modified, modified = pcall(function() return vim.bo[bufnr].modified end)
+    local ok_listed, listed = pcall(function() return vim.bo[bufnr].buflisted end)
+
+    local info = {
+      bufnr = bufnr,
+      name = buffer_name(bufnr),
+      filetype = filetype,
+      modified = ok_modified and bool(modified) or false,
+      lineCount = line_count,
+      listed = ok_listed and bool(listed) or false,
+      visible = false,
+    }
+    buffer_cache[bufnr] = info
+    return info
+  end
+
+  local visible_buffers = {}
+  local windows = {}
+  for _, win in ipairs(api.nvim_list_wins()) do
+    local ok_buf, bufnr = pcall(api.nvim_win_get_buf, win)
+    if ok_buf then
+      visible_buffers[bufnr] = true
+      local ok_cursor, win_cursor = pcall(api.nvim_win_get_cursor, win)
+      table.insert(windows, {
+        winid = win,
+        bufnr = bufnr,
+        file = buffer_name(bufnr),
+        cursor = pos(ok_cursor and win_cursor[1] or 0, ok_cursor and (win_cursor[2] + 1) or 0),
+      })
+    end
+  end
+
+  local function buffer_info_from_getbufinfo(item)
+    local bufnr = item.bufnr or 0
+    if bufnr <= 0 then return nil end
+
+    local loaded = bool(item.loaded)
+    local filetype = ''
+    if loaded then
+      local ok_ft, ft = pcall(function() return vim.bo[bufnr].filetype end)
+      filetype = ok_ft and ft or ''
+    end
+
+    local line_count = item.linecount or 0
+    if line_count == 0 and loaded then
+      local ok_count, count = pcall(api.nvim_buf_line_count, bufnr)
+      line_count = ok_count and count or 0
+    end
+
+    local info = {
+      bufnr = bufnr,
+      name = item.name or buffer_name(bufnr),
+      filetype = filetype,
+      modified = bool(item.changed),
+      lineCount = line_count,
+      listed = true,
+      visible = bool(visible_buffers[bufnr]),
+    }
+    buffer_cache[bufnr] = info
+    return info
+  end
+
+  local buffers = {}
+  local ok_bufinfo, listed_infos = pcall(fn.getbufinfo, { buflisted = 1 })
+  if ok_bufinfo and listed_infos then
+    for _, item in ipairs(listed_infos) do
+      local info = buffer_info_from_getbufinfo(item)
+      if info then
+        table.insert(buffers, info)
+        if #buffers >= max_buffers then break end
+      end
+    end
+  else
+    for _, bufnr in ipairs(api.nvim_list_bufs()) do
+      local ok, info = pcall(buffer_info, bufnr)
+      if ok and info.listed then
+        info.visible = bool(visible_buffers[bufnr])
+        table.insert(buffers, info)
+        if #buffers >= max_buffers then break end
+      end
+    end
+  end
+
+  local function quickfix_filename(item)
+    if type(item.filename) == 'string' and item.filename ~= '' then return item.filename end
+    local bufnr = item.bufnr or 0
+    if bufnr > 0 then return buffer_name(bufnr) end
+    return ''
+  end
+
+  local function read_quickfix()
+    if max_quickfix_items <= 0 then return nil end
+
+    -- idx MUST be 0, not 1. Asking for a specific index narrows the returned
+    -- items to that single entry, which silently reduced every quickfix list
+    -- to one item. idx=0 reports the current index and returns the whole list.
+    local ok_qf, qf = pcall(fn.getqflist, { title = 1, idx = 0, size = 1, items = 1 })
+    if not ok_qf or type(qf) ~= 'table' then return nil end
+
+    local all_items = qf.items or {}
+    local size = qf.size or #all_items
+    if size <= 0 or #all_items == 0 then return nil end
+
+    local idx = qf.idx or 0
+    local start_index = 1
+    local end_index = math.min(#all_items, max_quickfix_items)
+    if #all_items > max_quickfix_items and idx > 0 then
+      start_index = math.max(1, idx - math.floor(max_quickfix_items / 2))
+      end_index = math.min(#all_items, start_index + max_quickfix_items - 1)
+      start_index = math.max(1, end_index - max_quickfix_items + 1)
+    end
+
+    local items = {}
+    for index = start_index, end_index do
+      local item = all_items[index]
+      table.insert(items, {
+        index = index,
+        bufnr = item.bufnr or 0,
+        filename = quickfix_filename(item),
+        line = item.lnum or 0,
+        column = item.col or 0,
+        endLine = item.end_lnum or 0,
+        endColumn = item.end_col or 0,
+        type = item.type or '',
+        text = item.text or '',
+        valid = bool(item.valid),
+      })
+    end
+
+    return {
+      title = qf.title or '',
+      currentIndex = idx,
+      size = size,
+      items = items,
+      truncated = #all_items > #items,
+    }
+  end
+
+  local current_mode = api.nvim_get_mode().mode
+  local current_buf = api.nvim_get_current_buf()
+  local cursor = api.nvim_win_get_cursor(0)
+  local line = cursor[1]
+  local column = cursor[2] + 1
+  local start_line = math.max(1, line - surrounding)
+  local end_line = math.min(api.nvim_buf_line_count(current_buf), line + surrounding)
+  local surrounding_lines = {}
+  local current_line = nil
+  if surrounding > 0 then
+    local ok_lines, lines = pcall(api.nvim_buf_get_lines, current_buf, start_line - 1, end_line, false)
+    if ok_lines then
+      for index, text in ipairs(lines) do
+        local line_no = start_line + index - 1
+        if line_no == line then current_line = text end
+        table.insert(surrounding_lines, { line = line_no, text = text, current = line_no == line })
+      end
+    end
+  end
+
+  if current_line == nil then
+    local ok_current_line, fetched_line = pcall(api.nvim_get_current_line)
+    current_line = ok_current_line and fetched_line or ''
+  end
+
+  local current = buffer_info(current_buf)
+  current.visible = true
+
+  return fn.json_encode({
+    cwd = fn.getcwd(),
+    mode = current_mode,
+    currentFile = current.name,
+    currentBuffer = current,
+    cursor = { line = line, column = column, lineText = current_line },
+    surroundingLines = surrounding_lines,
+    selection = read_selection(current_mode),
+    search = fn.getreg('/'),
+    quickfix = read_quickfix(),
+    buffers = buffers,
+    windows = windows,
+  })
+end)()
+`;
+
+// core/snapshot.mjs
+var LIMIT_DEFAULTS = Object.freeze({
+  surroundingLines: 5,
+  maxSelectionBytes: 4e3,
+  maxBuffers: 30,
+  maxQuickfixItems: 30
+});
+var DEFAULT_SURROUNDING_LINES = LIMIT_DEFAULTS.surroundingLines;
+var DEFAULT_MAX_SELECTION_BYTES = LIMIT_DEFAULTS.maxSelectionBytes;
+var DEFAULT_MAX_BUFFERS = LIMIT_DEFAULTS.maxBuffers;
+var DEFAULT_MAX_QUICKFIX_ITEMS = LIMIT_DEFAULTS.maxQuickfixItems;
+var SnapshotShapeError = class extends Error {
+  constructor(message, { raw } = {}) {
+    super(message);
+    this.name = "SnapshotShapeError";
+    if (raw !== void 0) this.raw = excerpt(raw);
   }
-  const json = result.stdout.trim() || result.stderr.trim();
-  if (!json) throw new Error("Neovim returned an empty server summary");
-  const summary = JSON.parse(json);
-  return { ...summary, server };
+};
+function excerpt(text, max = 200) {
+  const value = String(text);
+  return value.length <= max ? value : `${value.slice(0, max)}\u2026`;
+}
+var SNAPSHOT_LUA_QUOTED = vimSingleQuoted(SNAPSHOT_LUA);
+function summaryRequest() {
+  return { kind: "summary", expression: `luaeval(${vimSingleQuoted(SUMMARY_LUA)})` };
+}
+function parseJson(raw, what) {
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new SnapshotShapeError(`Neovim returned an empty ${what}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new SnapshotShapeError(`Neovim returned unparseable ${what} JSON: ${errorToMessage(error)}`, { raw });
+  }
+}
+function asPosition(value) {
+  return { line: Number(value?.line ?? 0), column: Number(value?.column ?? 0) };
+}
+function toSummary(raw, { server }) {
+  const parsed = parseJson(raw, "server summary");
+  return {
+    server,
+    cwd: parsed.cwd ?? "",
+    currentFile: parsed.currentFile ?? "",
+    cursor: asPosition(parsed.cursor)
+  };
 }
 
-// core/discover.mjs
+// core/transport.mjs
+import { lstat, readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+var DEFAULT_LIST_TIMEOUT_MS = 1500;
+var MAX_SOCKETS = 3e3;
+var SOCKET_SCAN_DEPTH = 5;
+function createSpawnTransport({ run = runProcess, env = process.env, platform = process.platform } = {}) {
+  return {
+    async evaluate(server, request, options = {}) {
+      const result = await run("nvim", ["--server", server, "--remote-expr", request.expression], {
+        timeoutMs: options.timeoutMs
+      });
+      if (result.code !== 0) {
+        throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
+      }
+      return result.stdout.trim() || result.stderr.trim();
+    },
+    /** Ask a throwaway headless Neovim which servers are running. Never throws. */
+    async listServers(options = {}) {
+      try {
+        const result = await run(
+          "nvim",
+          ["--headless", "--clean", "-n", "+echo json_encode({'self': v:servername, 'servers': serverlist()})", "+qa"],
+          { timeoutMs: options.timeoutMs ?? DEFAULT_LIST_TIMEOUT_MS }
+        );
+        const parsed = parseFirstJsonObject(result.stdout + result.stderr);
+        if (!Array.isArray(parsed?.servers)) return [];
+        return parsed.servers.filter((server) => typeof server === "string" && server && server !== parsed.self);
+      } catch {
+        return [];
+      }
+    },
+    /** Scan likely runtime directories for Neovim-looking unix sockets. Never throws. */
+    async scanSocketFiles() {
+      if (platform === "win32") return [];
+      const roots = uniqueExistingRealpaths([env.XDG_RUNTIME_DIR, env.TMPDIR, tmpdir(), "/tmp"]);
+      const sockets = [];
+      const seen = /* @__PURE__ */ new Set();
+      const addSocket = (path) => {
+        if (seen.has(path)) return;
+        seen.add(path);
+        sockets.push(path);
+      };
+      const walk = async (dir, depth, inNvimishDir) => {
+        if (depth < 0 || sockets.length >= MAX_SOCKETS) return;
+        let entries;
+        try {
+          entries = await readdir(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          if (sockets.length >= MAX_SOCKETS) return;
+          const path = join(dir, entry.name);
+          const nameIsNvimish = entry.name.toLowerCase().includes("nvim");
+          const pathIsNvimish = inNvimishDir || nameIsNvimish || path.toLowerCase().includes("nvim");
+          if (entry.isSocket?.()) {
+            if (pathIsNvimish) addSocket(path);
+            continue;
+          }
+          if (!entry.isDirectory()) {
+            if (!pathIsNvimish) continue;
+            try {
+              if ((await lstat(path)).isSocket()) addSocket(path);
+            } catch {
+            }
+            continue;
+          }
+          if (depth === 0) continue;
+          if (pathIsNvimish) await walk(path, depth - 1, true);
+        }
+      };
+      for (const root of roots) {
+        await walk(root, SOCKET_SCAN_DEPTH, false);
+      }
+      return sockets;
+    }
+  };
+}
+
+// core/discovery.mjs
 var PROBE_CONCURRENCY = 4;
 var DEFAULT_PROBE_TIMEOUT_MS = 1200;
-async function listServersFromNvim() {
-  try {
-    const result = await runProcess(
-      "nvim",
-      [
-        "--headless",
-        "--clean",
-        "-n",
-        "+echo json_encode({'self': v:servername, 'servers': serverlist()})",
-        "+qa"
-      ],
-      { timeoutMs: 1500 }
-    );
-    const parsed = parseFirstJsonObject(result.stdout + result.stderr);
-    if (!parsed?.servers || !Array.isArray(parsed.servers)) return [];
-    return parsed.servers.filter((server) => typeof server === "string" && server && server !== parsed.self);
-  } catch {
-    return [];
-  }
+function chooseBestNvimServer(candidates, cwd) {
+  return candidates.find((item) => item.cwd === cwd) ?? candidates.find((item) => isInside(cwd, item.currentFile)) ?? candidates.find((item) => isInside(item.cwd, cwd)) ?? candidates[0];
 }
-async function scanNvimSocketFiles() {
-  if (process.platform === "win32") return [];
-  const roots = uniqueExistingRealpaths([process.env.XDG_RUNTIME_DIR, process.env.TMPDIR, tmpdir(), "/tmp"]);
-  const sockets = [];
-  const seen = /* @__PURE__ */ new Set();
-  const maxSockets = 3e3;
-  const addSocket = (path) => {
-    if (seen.has(path)) return;
-    seen.add(path);
-    sockets.push(path);
-  };
-  const walk = async (dir, depth, inNvimishDir) => {
-    if (depth < 0 || sockets.length >= maxSockets) return;
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
+function createDiscovery({ transport = createSpawnTransport(), env = process.env } = {}) {
+  function tagged(entries) {
+    const seen = /* @__PURE__ */ new Set();
+    const list = [];
+    for (const [server, source] of entries) {
+      const address = server?.trim();
+      if (!address || seen.has(address)) continue;
+      seen.add(address);
+      list.push({ server: address, source });
     }
-    for (const entry of entries) {
-      if (sockets.length >= maxSockets) return;
-      const path = join(dir, entry.name);
-      const pathLower = path.toLowerCase();
-      const nameIsNvimish = entry.name.toLowerCase().includes("nvim");
-      const pathIsNvimish = inNvimishDir || nameIsNvimish || pathLower.includes("nvim");
-      if (entry.isSocket?.()) {
-        if (pathIsNvimish) addSocket(path);
-        continue;
+    return list;
+  }
+  async function probe(candidates, timeoutMs) {
+    return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (candidate) => {
+      try {
+        const raw = await transport.evaluate(candidate.server, summaryRequest(), { timeoutMs });
+        return { ok: { ...candidate, ...toSummary(raw, { server: candidate.server }), probed: true } };
+      } catch (error) {
+        return { failure: `${candidate.server}: ${errorToMessage(error)}` };
       }
-      if (!entry.isDirectory()) {
-        if (!pathIsNvimish) continue;
-        try {
-          if ((await lstat(path)).isSocket()) addSocket(path);
-        } catch {
-        }
-        continue;
-      }
-      if (depth === 0) continue;
-      if (pathIsNvimish) {
-        await walk(path, depth - 1, true);
+    });
+  }
+  async function discover({ explicit, cwd = process.cwd(), timeoutMs = DEFAULT_PROBE_TIMEOUT_MS, probeExplicit = true } = {}) {
+    if (explicit && !probeExplicit) {
+      const candidate = { server: explicit, source: "explicit", probed: false };
+      return { candidates: [candidate], failures: [], best: candidate, source: "explicit" };
+    }
+    const fast = explicit ? tagged([[explicit, "explicit"]]) : tagged([
+      [env.NVIM, "env"],
+      [env.NVIM_LISTEN_ADDRESS, "env"],
+      ...(await transport.listServers()).map((server) => [server, "serverlist"])
+    ]);
+    let results = fast.length > 0 ? await probe(fast, timeoutMs) : [];
+    let candidates = results.flatMap((r) => r.ok ? [r.ok] : []);
+    if (!explicit && candidates.length === 0) {
+      const known = new Set(fast.map((c) => c.server));
+      const scanned = tagged((await transport.scanSocketFiles()).filter((s) => !known.has(s)).map((s) => [s, "scan"]));
+      if (scanned.length > 0) {
+        results = [...results, ...await probe(scanned, timeoutMs)];
+        candidates = results.flatMap((r) => r.ok ? [r.ok] : []);
       }
     }
-  };
-  for (const root of roots) {
-    await walk(root, 5, false);
+    const failures = results.flatMap((r) => r.failure ? [r.failure] : []);
+    const best = chooseBestNvimServer(candidates, cwd);
+    return { candidates, failures, best: best ?? null, source: best?.source ?? "none" };
   }
-  return sockets;
-}
-async function fastCandidates(explicit) {
-  if (explicit) return [explicit];
-  return uniqueStrings([
-    process.env.NVIM,
-    process.env.NVIM_LISTEN_ADDRESS,
-    ...await listServersFromNvim()
-  ]);
-}
-async function probeSummaries(candidates, options = {}) {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (server) => {
-    try {
-      return { server, summary: await getNvimServerSummary(server, { timeoutMs }) };
-    } catch (error) {
-      return { server, error: errorToMessage(error) };
-    }
-  });
-}
-function chooseBestNvimServer(items, cwd) {
-  const best = items.find((item) => item.cwd === cwd) ?? items.find((item) => isInside(cwd, item.currentFile)) ?? items.find((item) => isInside(item.cwd, cwd)) ?? items[0];
-  if (!best) throw new Error("No Neovim server candidates responded");
-  return best;
-}
-async function collectServerSummaries(options = {}) {
-  const explicit = options.explicit;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  const fast = await fastCandidates(explicit);
-  let results = fast.length > 0 ? await probeSummaries(fast, { timeoutMs }) : [];
-  let summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
-  if (!explicit && summaries.length === 0) {
-    const scanned = uniqueStrings((await scanNvimSocketFiles()).filter((s) => !fast.includes(s)));
-    if (scanned.length > 0) {
-      results = [...results, ...await probeSummaries(scanned, { timeoutMs })];
-      summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
-    }
-  }
-  const failures = results.flatMap((r) => r.error ? [`${r.server}: ${r.error}`] : []);
-  return { summaries, failures, candidateCount: summaries.length };
+  return { discover };
 }
 
 // core/launcher.mjs
@@ -342,8 +691,12 @@ function requireValue(args, index, name) {
   return value;
 }
 async function selectNvimServer({ name, explicitServer, launchCwd }) {
-  const { summaries, failures } = await collectServerSummaries({ explicit: explicitServer });
-  if (summaries.length === 0) {
+  const { candidates, failures } = await createDiscovery().discover({
+    explicit: explicitServer,
+    cwd: launchCwd,
+    probeExplicit: true
+  });
+  if (candidates.length === 0) {
     if (explicitServer) {
       console.error(`${name}: ${explicitServer} did not respond; staying in ${launchCwd}`);
     } else if (failures.length > 0) {
@@ -352,17 +705,17 @@ async function selectNvimServer({ name, explicitServer, launchCwd }) {
     return explicitServer ? { server: explicitServer, cwd: void 0 } : void 0;
   }
   if (explicitServer) {
-    return summaries.find((summary) => summary.server === explicitServer) ?? summaries[0];
+    return candidates.find((candidate) => candidate.server === explicitServer) ?? candidates[0];
   }
-  if (summaries.length === 1) {
-    return summaries[0];
+  if (candidates.length === 1) {
+    return candidates[0];
   }
   if (process.stdin.isTTY && process.stdout.isTTY) {
-    return promptForServer(summaries, launchCwd);
+    return promptForServer(candidates, launchCwd);
   }
-  const selected = chooseBestNvimServer(summaries, launchCwd);
+  const selected = chooseBestNvimServer(candidates, launchCwd);
   console.error(
-    `${name}: found ${summaries.length} Neovim instances; selected ${basename(selected.cwd) || selected.cwd}. Pass --nvim-server to choose explicitly.`
+    `${name}: found ${candidates.length} Neovim instances; selected ${basename(selected.cwd) || selected.cwd}. Pass --nvim-server to choose explicitly.`
   );
   return selected;
 }

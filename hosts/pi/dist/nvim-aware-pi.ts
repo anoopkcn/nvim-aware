@@ -87,6 +87,13 @@ function isInside(parent, child) {
 function vimSingleQuoted(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
+function vimNumberDict(values) {
+  const entries = Object.entries(values).map(([key, value]) => {
+    if (!Number.isFinite(value)) throw new Error(`vimNumberDict: ${key} is not a finite number`);
+    return `${vimSingleQuoted(key)}: ${value}`;
+  });
+  return `{${entries.join(", ")}}`;
+}
 function safeRealpath(path) {
   try {
     return realpathSync(path);
@@ -97,8 +104,8 @@ function safeRealpath(path) {
 function errorToMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
-function readEnvMs(name, fallback) {
-  const raw = process.env[name];
+function readEnvMs(env, name, fallback) {
+  const raw = env[name];
   if (!raw) return fallback;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
@@ -108,51 +115,71 @@ function asNonEmptyString(value) {
 }
 
 // core/config.mjs
-function getExplicitServer() {
-  return asNonEmptyString(process.env.NVIM_AWARE_SERVER);
-}
-function getSnapshotTtlMs() {
-  return readEnvMs("NVIM_AWARE_SNAPSHOT_TTL_MS", 750);
-}
-function getPromptRefreshTimeoutMs() {
-  return readEnvMs("NVIM_AWARE_PROMPT_TIMEOUT_MS", 800);
+var CONFIG_DEFAULTS = Object.freeze({
+  promptContextMode: "auto",
+  snapshotTtlMs: 750,
+  promptTimeoutMs: 800
+});
+var VALID_PROMPT_CONTEXT_MODES = /* @__PURE__ */ new Set(["auto", "full", "hint", "off"]);
+var FALSY = /* @__PURE__ */ new Set(["0", "false", "no"]);
+function readConfig(env = process.env) {
+  const mode = asNonEmptyString(env.NVIM_AWARE_PROMPT_CONTEXT)?.toLowerCase();
+  const disable = asNonEmptyString(env.NVIM_AWARE_DISABLE)?.toLowerCase();
+  return Object.freeze({
+    server: asNonEmptyString(env.NVIM_AWARE_SERVER),
+    promptContextMode: mode && VALID_PROMPT_CONTEXT_MODES.has(mode) ? mode : CONFIG_DEFAULTS.promptContextMode,
+    snapshotTtlMs: readEnvMs(env, "NVIM_AWARE_SNAPSHOT_TTL_MS", CONFIG_DEFAULTS.snapshotTtlMs),
+    promptTimeoutMs: readEnvMs(env, "NVIM_AWARE_PROMPT_TIMEOUT_MS", CONFIG_DEFAULTS.promptTimeoutMs),
+    disabled: disable !== void 0 && !FALSY.has(disable)
+  });
 }
 
-// core/discover.mjs
-import { lstat, readdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+// core/injection.mjs
+var NONE = Object.freeze({ kind: "none" });
+var HINT = Object.freeze({ kind: "hint" });
+var SNAPSHOT = Object.freeze({ kind: "snapshot" });
+var PROMPT_PATTERNS = [
+  // The editor by name.
+  /\b(neovim|nvim)\b/,
+  // "the current file", "the open buffer", "the active window".
+  /\b(current|open|active|focused)\s+(file|buffer|window|tab|split|pane|line|selection|directory|folder|project|repo|repository)\b/,
+  // A demonstrative plus something that lives in a buffer.
+  /\b(this|that|these|those)\s+(files?|buffers?|code|functions?|class(?:es)?|methods?|selections?|snippets?|lines?|variables?|symbols?|tests?|blocks?|statements?|types?|imports?|sections?|errors?)\b/,
+  // The visual selection.
+  /\b(selected|selection|visual selection|highlighted)\b/,
+  // The cursor.
+  /\b(cursor|under cursor|around here|right here|line under|current line)\b/,
+  // Quickfix and diagnostics.
+  /\b(quickfix|qflist|quickfix list|diagnostics?|errors?|warnings?|lint|linter|compiler|build failure)\b/,
+  // Registers, buffer lists, window layout.
+  /\b(search register|last search|open buffers?|listed buffers?|visible windows?)\b/,
+  // "what files are open", "which buffer am I in".
+  /\b(files?|buffers?|windows?|tabs?)\s+(are|is)\s+open\b/,
+  /\bwhich\s+(file|buffer|window|tab)\b/,
+  // Locational questions about the editing position.
+  /\bwhere\s+am\s+i\b/,
+  /\bwhat\s+am\s+i\s+(looking at|editing|viewing|working on)\b/
+];
+function promptLikelyNeedsNvimContext(prompt) {
+  const text = String(prompt ?? "").toLowerCase();
+  return PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+function decideInjection({ prompt, config }) {
+  if (config.disabled) return NONE;
+  switch (config.promptContextMode) {
+    case "off":
+      return NONE;
+    case "hint":
+      return HINT;
+    case "full":
+      return SNAPSHOT;
+    default:
+      return promptLikelyNeedsNvimContext(prompt) ? SNAPSHOT : NONE;
+  }
+}
 
-// core/snapshot.mjs
-var DEFAULT_SURROUNDING_LINES = 5;
-var DEFAULT_MAX_SELECTION_BYTES = 4e3;
-var DEFAULT_MAX_BUFFERS = 30;
-var DEFAULT_MAX_QUICKFIX_ITEMS = 30;
-var snapshotExpressionCache = /* @__PURE__ */ new Map();
-var snapshotCache = /* @__PURE__ */ new Map();
-var snapshotInFlight = /* @__PURE__ */ new Map();
-function normalizeSnapshotOptions(options = {}) {
-  return {
-    surroundingLines: Math.max(0, Math.floor(options.surroundingLines ?? DEFAULT_SURROUNDING_LINES)),
-    maxSelectionBytes: Math.max(0, Math.floor(options.maxSelectionBytes ?? DEFAULT_MAX_SELECTION_BYTES)),
-    maxBuffers: Math.max(1, Math.floor(options.maxBuffers ?? DEFAULT_MAX_BUFFERS)),
-    maxQuickfixItems: Math.max(0, Math.floor(options.maxQuickfixItems ?? DEFAULT_MAX_QUICKFIX_ITEMS))
-  };
-}
-function snapshotOptionsKey(options) {
-  return `${options.surroundingLines}:${options.maxSelectionBytes}:${options.maxBuffers}:${options.maxQuickfixItems}`;
-}
-function snapshotCacheKey(server, options) {
-  return `${server}\0${snapshotOptionsKey(options)}`;
-}
-function rememberSnapshot(snapshot, options) {
-  snapshotCache.set(snapshotCacheKey(snapshot.server, options), { snapshot, createdAt: Date.now() });
-}
-function cachedSnapshotEntry(server, options) {
-  return snapshotCache.get(snapshotCacheKey(server, normalizeSnapshotOptions(options)));
-}
-function makeServerSummaryExpression() {
-  const lua = String.raw`
+// core/snapshot-lua.mjs
+var SUMMARY_LUA = String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
@@ -164,20 +191,14 @@ function makeServerSummaryExpression() {
   })
 end)()
 `;
-  return `luaeval(${vimSingleQuoted(lua)})`;
-}
-function makeSnapshotExpression(options) {
-  const cacheKey = snapshotOptionsKey(options);
-  const cached = snapshotExpressionCache.get(cacheKey);
-  if (cached) return cached;
-  const lua = String.raw`
+var SNAPSHOT_LUA = String.raw`
 (function()
   local api = vim.api
   local fn = vim.fn
-  local surrounding = ${options.surroundingLines}
-  local max_selection_bytes = ${options.maxSelectionBytes}
-  local max_buffers = ${options.maxBuffers}
-  local max_quickfix_items = ${options.maxQuickfixItems}
+  local surrounding = _A.surroundingLines
+  local max_selection_bytes = _A.maxSelectionBytes
+  local max_buffers = _A.maxBuffers
+  local max_quickfix_items = _A.maxQuickfixItems
   local visual_block = string.char(22)
   local select_block = string.char(19)
   local newline = string.char(10)
@@ -377,7 +398,10 @@ function makeSnapshotExpression(options) {
   local function read_quickfix()
     if max_quickfix_items <= 0 then return nil end
 
-    local ok_qf, qf = pcall(fn.getqflist, { title = 1, idx = 1, size = 1, items = 1 })
+    -- idx MUST be 0, not 1. Asking for a specific index narrows the returned
+    -- items to that single entry, which silently reduced every quickfix list
+    -- to one item. idx=0 reports the current index and returns the whole list.
+    local ok_qf, qf = pcall(fn.getqflist, { title = 1, idx = 0, size = 1, items = 1 })
     if not ok_qf or type(qf) ~= 'table' then return nil end
 
     local all_items = qf.items or {}
@@ -462,201 +486,373 @@ function makeSnapshotExpression(options) {
   })
 end)()
 `;
-  const expr = `luaeval(${vimSingleQuoted(lua)})`;
-  snapshotExpressionCache.set(cacheKey, expr);
-  return expr;
-}
-async function getNvimSnapshot(server, options = {}) {
-  const normalized = normalizeSnapshotOptions(options);
-  const expr = makeSnapshotExpression(normalized);
-  const result = await runProcess("nvim", ["--server", server, "--remote-expr", expr], {
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  });
-  if (result.code !== 0) {
-    throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
+
+// core/snapshot.mjs
+var LIMIT_DEFAULTS = Object.freeze({
+  surroundingLines: 5,
+  maxSelectionBytes: 4e3,
+  maxBuffers: 30,
+  maxQuickfixItems: 30
+});
+var DEFAULT_SURROUNDING_LINES = LIMIT_DEFAULTS.surroundingLines;
+var DEFAULT_MAX_SELECTION_BYTES = LIMIT_DEFAULTS.maxSelectionBytes;
+var DEFAULT_MAX_BUFFERS = LIMIT_DEFAULTS.maxBuffers;
+var DEFAULT_MAX_QUICKFIX_ITEMS = LIMIT_DEFAULTS.maxQuickfixItems;
+var SnapshotShapeError = class extends Error {
+  constructor(message, { raw } = {}) {
+    super(message);
+    this.name = "SnapshotShapeError";
+    if (raw !== void 0) this.raw = excerpt(raw);
   }
-  const json = result.stdout.trim() || result.stderr.trim();
-  if (!json) throw new Error("Neovim returned an empty snapshot");
-  const snapshot = JSON.parse(json);
-  return { ...snapshot, server };
+};
+function excerpt(text, max = 200) {
+  const value = String(text);
+  return value.length <= max ? value : `${value.slice(0, max)}\u2026`;
 }
-async function getNvimServerSummary(server, options = {}) {
-  const result = await runProcess("nvim", ["--server", server, "--remote-expr", makeServerSummaryExpression()], {
-    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  });
-  if (result.code !== 0) {
-    throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
-  }
-  const json = result.stdout.trim() || result.stderr.trim();
-  if (!json) throw new Error("Neovim returned an empty server summary");
-  const summary = JSON.parse(json);
-  return { ...summary, server };
+function normalizeLimits(limits = {}) {
+  return {
+    surroundingLines: Math.max(0, Math.floor(limits.surroundingLines ?? LIMIT_DEFAULTS.surroundingLines)),
+    maxSelectionBytes: Math.max(0, Math.floor(limits.maxSelectionBytes ?? LIMIT_DEFAULTS.maxSelectionBytes)),
+    maxBuffers: Math.max(1, Math.floor(limits.maxBuffers ?? LIMIT_DEFAULTS.maxBuffers)),
+    maxQuickfixItems: Math.max(0, Math.floor(limits.maxQuickfixItems ?? LIMIT_DEFAULTS.maxQuickfixItems))
+  };
 }
-async function getCachedNvimSnapshot(server, options = {}, cacheOptions = {}) {
-  const normalized = normalizeSnapshotOptions(options);
-  const cacheKey = snapshotCacheKey(server, normalized);
-  const now = Date.now();
-  const cached = snapshotCache.get(cacheKey);
-  const ttlMs = cacheOptions.ttlMs ?? 0;
-  if (!cacheOptions.force && ttlMs > 0 && cached && now - cached.createdAt <= ttlMs) {
-    return cached.snapshot;
-  }
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const requestKey = `${cacheKey}\0${timeoutMs}`;
-  const inFlight = snapshotInFlight.get(requestKey);
-  if (inFlight) return inFlight;
-  const promise = getNvimSnapshot(server, { ...normalized, timeoutMs }).then((snapshot) => {
-    rememberSnapshot(snapshot, normalized);
-    return snapshot;
-  }).finally(() => {
-    snapshotInFlight.delete(requestKey);
-  });
-  snapshotInFlight.set(requestKey, promise);
-  return promise;
+function limitsKey(limits) {
+  return `${limits.surroundingLines}:${limits.maxSelectionBytes}:${limits.maxBuffers}:${limits.maxQuickfixItems}`;
 }
-async function getPromptNvimSnapshot(server, { ttlMs, refreshTimeoutMs, options = {} }) {
-  const normalized = normalizeSnapshotOptions(options);
-  const cached = cachedSnapshotEntry(server, normalized);
-  if (cached && Date.now() - cached.createdAt <= ttlMs) {
-    return { snapshot: cached.snapshot };
+var SNAPSHOT_LUA_QUOTED = vimSingleQuoted(SNAPSHOT_LUA);
+function snapshotRequest(limits) {
+  const normalized = normalizeLimits(limits);
+  return { kind: "snapshot", expression: `luaeval(${SNAPSHOT_LUA_QUOTED}, ${vimNumberDict(normalized)})` };
+}
+function summaryRequest() {
+  return { kind: "summary", expression: `luaeval(${vimSingleQuoted(SUMMARY_LUA)})` };
+}
+function parseJson(raw, what) {
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new SnapshotShapeError(`Neovim returned an empty ${what}`);
   }
-  const timeoutMs = cached ? refreshTimeoutMs : DEFAULT_TIMEOUT_MS;
   try {
-    const snapshot = await getCachedNvimSnapshot(server, { ...normalized, timeoutMs }, { force: true });
-    return { snapshot };
+    return JSON.parse(raw);
   } catch (error) {
-    if (cached) return { snapshot: cached.snapshot, warning: errorToMessage(error) };
-    throw error;
+    throw new SnapshotShapeError(`Neovim returned unparseable ${what} JSON: ${errorToMessage(error)}`, { raw });
   }
+}
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return Object.values(value);
+  return [];
+}
+function asPosition(value) {
+  return { line: Number(value?.line ?? 0), column: Number(value?.column ?? 0) };
+}
+function toSnapshot(raw, { server }) {
+  const parsed = parseJson(raw, "snapshot");
+  if (!parsed.currentBuffer || typeof parsed.currentBuffer !== "object") {
+    throw new SnapshotShapeError("snapshot is missing currentBuffer", { raw });
+  }
+  if (!parsed.cursor || typeof parsed.cursor !== "object") {
+    throw new SnapshotShapeError("snapshot is missing cursor", { raw });
+  }
+  const quickfix = parsed.quickfix ? { ...parsed.quickfix, items: asArray(parsed.quickfix.items), size: Number(parsed.quickfix.size ?? 0) } : null;
+  return {
+    server,
+    cwd: parsed.cwd ?? "",
+    mode: parsed.mode ?? "",
+    currentFile: parsed.currentFile ?? "",
+    currentBuffer: parsed.currentBuffer,
+    cursor: { ...asPosition(parsed.cursor), lineText: parsed.cursor.lineText ?? "" },
+    // Lua drops nil keys entirely, so absence is normal, not a defect.
+    selection: parsed.selection ?? null,
+    search: parsed.search ?? "",
+    quickfix,
+    surroundingLines: asArray(parsed.surroundingLines),
+    buffers: asArray(parsed.buffers),
+    windows: asArray(parsed.windows)
+  };
+}
+function toSummary(raw, { server }) {
+  const parsed = parseJson(raw, "server summary");
+  return {
+    server,
+    cwd: parsed.cwd ?? "",
+    currentFile: parsed.currentFile ?? "",
+    cursor: asPosition(parsed.cursor)
+  };
 }
 
-// core/discover.mjs
+// core/transport.mjs
+import { lstat, readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+var DEFAULT_LIST_TIMEOUT_MS = 1500;
+var MAX_SOCKETS = 3e3;
+var SOCKET_SCAN_DEPTH = 5;
+function createSpawnTransport({ run = runProcess, env = process.env, platform = process.platform } = {}) {
+  return {
+    async evaluate(server, request, options = {}) {
+      const result = await run("nvim", ["--server", server, "--remote-expr", request.expression], {
+        timeoutMs: options.timeoutMs
+      });
+      if (result.code !== 0) {
+        throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
+      }
+      return result.stdout.trim() || result.stderr.trim();
+    },
+    /** Ask a throwaway headless Neovim which servers are running. Never throws. */
+    async listServers(options = {}) {
+      try {
+        const result = await run(
+          "nvim",
+          ["--headless", "--clean", "-n", "+echo json_encode({'self': v:servername, 'servers': serverlist()})", "+qa"],
+          { timeoutMs: options.timeoutMs ?? DEFAULT_LIST_TIMEOUT_MS }
+        );
+        const parsed = parseFirstJsonObject(result.stdout + result.stderr);
+        if (!Array.isArray(parsed?.servers)) return [];
+        return parsed.servers.filter((server) => typeof server === "string" && server && server !== parsed.self);
+      } catch {
+        return [];
+      }
+    },
+    /** Scan likely runtime directories for Neovim-looking unix sockets. Never throws. */
+    async scanSocketFiles() {
+      if (platform === "win32") return [];
+      const roots = uniqueExistingRealpaths([env.XDG_RUNTIME_DIR, env.TMPDIR, tmpdir(), "/tmp"]);
+      const sockets = [];
+      const seen = /* @__PURE__ */ new Set();
+      const addSocket = (path) => {
+        if (seen.has(path)) return;
+        seen.add(path);
+        sockets.push(path);
+      };
+      const walk = async (dir, depth, inNvimishDir) => {
+        if (depth < 0 || sockets.length >= MAX_SOCKETS) return;
+        let entries;
+        try {
+          entries = await readdir(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          if (sockets.length >= MAX_SOCKETS) return;
+          const path = join(dir, entry.name);
+          const nameIsNvimish = entry.name.toLowerCase().includes("nvim");
+          const pathIsNvimish = inNvimishDir || nameIsNvimish || path.toLowerCase().includes("nvim");
+          if (entry.isSocket?.()) {
+            if (pathIsNvimish) addSocket(path);
+            continue;
+          }
+          if (!entry.isDirectory()) {
+            if (!pathIsNvimish) continue;
+            try {
+              if ((await lstat(path)).isSocket()) addSocket(path);
+            } catch {
+            }
+            continue;
+          }
+          if (depth === 0) continue;
+          if (pathIsNvimish) await walk(path, depth - 1, true);
+        }
+      };
+      for (const root of roots) {
+        await walk(root, SOCKET_SCAN_DEPTH, false);
+      }
+      return sockets;
+    }
+  };
+}
+
+// core/discovery.mjs
 var PROBE_CONCURRENCY = 4;
 var DEFAULT_PROBE_TIMEOUT_MS = 1200;
-async function listServersFromNvim() {
-  try {
-    const result = await runProcess(
-      "nvim",
-      [
-        "--headless",
-        "--clean",
-        "-n",
-        "+echo json_encode({'self': v:servername, 'servers': serverlist()})",
-        "+qa"
-      ],
-      { timeoutMs: 1500 }
-    );
-    const parsed = parseFirstJsonObject(result.stdout + result.stderr);
-    if (!parsed?.servers || !Array.isArray(parsed.servers)) return [];
-    return parsed.servers.filter((server) => typeof server === "string" && server && server !== parsed.self);
-  } catch {
-    return [];
-  }
+function chooseBestNvimServer(candidates, cwd) {
+  return candidates.find((item) => item.cwd === cwd) ?? candidates.find((item) => isInside(cwd, item.currentFile)) ?? candidates.find((item) => isInside(item.cwd, cwd)) ?? candidates[0];
 }
-async function scanNvimSocketFiles() {
-  if (process.platform === "win32") return [];
-  const roots = uniqueExistingRealpaths([process.env.XDG_RUNTIME_DIR, process.env.TMPDIR, tmpdir(), "/tmp"]);
-  const sockets = [];
-  const seen = /* @__PURE__ */ new Set();
-  const maxSockets = 3e3;
-  const addSocket = (path) => {
-    if (seen.has(path)) return;
-    seen.add(path);
-    sockets.push(path);
-  };
-  const walk = async (dir, depth, inNvimishDir) => {
-    if (depth < 0 || sockets.length >= maxSockets) return;
-    let entries;
+function describeDiscoveryFailure({ failures }) {
+  if (failures.length > 0) {
+    return `Found Neovim server candidates, but none responded. ${failures.join("; ")}`;
+  }
+  return "No Neovim server found. Start Neovim normally, or run `nvim --listen /tmp/nvim-main` and set NVIM_AWARE_SERVER=/tmp/nvim-main.";
+}
+function createDiscovery({ transport = createSpawnTransport(), env = process.env } = {}) {
+  function tagged(entries) {
+    const seen = /* @__PURE__ */ new Set();
+    const list = [];
+    for (const [server, source] of entries) {
+      const address = server?.trim();
+      if (!address || seen.has(address)) continue;
+      seen.add(address);
+      list.push({ server: address, source });
+    }
+    return list;
+  }
+  async function probe(candidates, timeoutMs) {
+    return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (candidate) => {
+      try {
+        const raw = await transport.evaluate(candidate.server, summaryRequest(), { timeoutMs });
+        return { ok: { ...candidate, ...toSummary(raw, { server: candidate.server }), probed: true } };
+      } catch (error) {
+        return { failure: `${candidate.server}: ${errorToMessage(error)}` };
+      }
+    });
+  }
+  async function discover({ explicit, cwd = process.cwd(), timeoutMs = DEFAULT_PROBE_TIMEOUT_MS, probeExplicit = true } = {}) {
+    if (explicit && !probeExplicit) {
+      const candidate = { server: explicit, source: "explicit", probed: false };
+      return { candidates: [candidate], failures: [], best: candidate, source: "explicit" };
+    }
+    const fast = explicit ? tagged([[explicit, "explicit"]]) : tagged([
+      [env.NVIM, "env"],
+      [env.NVIM_LISTEN_ADDRESS, "env"],
+      ...(await transport.listServers()).map((server) => [server, "serverlist"])
+    ]);
+    let results = fast.length > 0 ? await probe(fast, timeoutMs) : [];
+    let candidates = results.flatMap((r) => r.ok ? [r.ok] : []);
+    if (!explicit && candidates.length === 0) {
+      const known = new Set(fast.map((c) => c.server));
+      const scanned = tagged((await transport.scanSocketFiles()).filter((s) => !known.has(s)).map((s) => [s, "scan"]));
+      if (scanned.length > 0) {
+        results = [...results, ...await probe(scanned, timeoutMs)];
+        candidates = results.flatMap((r) => r.ok ? [r.ok] : []);
+      }
+    }
+    const failures = results.flatMap((r) => r.failure ? [r.failure] : []);
+    const best = chooseBestNvimServer(candidates, cwd);
+    return { candidates, failures, best: best ?? null, source: best?.source ?? "none" };
+  }
+  return { discover };
+}
+async function resolveNvimServer(options = {}) {
+  const discovery = options.discovery ?? createDiscovery({ transport: options.transport, env: options.env });
+  const result = await discovery.discover({
+    explicit: options.explicit,
+    cwd: options.cwd,
+    timeoutMs: options.timeoutMs,
+    probeExplicit: options.probeExplicit ?? false
+  });
+  if (!result.best) throw new Error(describeDiscoveryFailure(result));
+  return { server: result.best.server, summary: result.best, candidateCount: result.candidates.length, source: result.source };
+}
+
+// core/session.mjs
+var DEFAULT_TIMEOUT_MS2 = 2e3;
+var DEFAULT_REDISCOVER_BACKOFF_MS = 1e4;
+var DEFAULT_MAX_CACHE_ENTRIES = 8;
+function createNvimSession({
+  transport = createSpawnTransport(),
+  resolve,
+  explicitServer,
+  cwd = () => process.cwd(),
+  defaultTimeoutMs = DEFAULT_TIMEOUT_MS2,
+  ttlMs = 0,
+  staleTimeoutMs,
+  maxCacheEntries = DEFAULT_MAX_CACHE_ENTRIES,
+  rediscoverBackoffMs = DEFAULT_REDISCOVER_BACKOFF_MS,
+  now = Date.now
+} = {}) {
+  const resolveConnection = resolve ?? ((input) => resolveNvimServer({ ...input, transport }));
+  const currentCwd = () => typeof cwd === "function" ? cwd() : cwd;
+  let connectionPromise = null;
+  let backoffUntil = 0;
+  let lastError;
+  const cache = /* @__PURE__ */ new Map();
+  const inFlight = /* @__PURE__ */ new Map();
+  function connection() {
+    if (connectionPromise) return connectionPromise;
+    if (lastError && now() < backoffUntil) return Promise.reject(lastError);
+    connectionPromise = Promise.resolve().then(() => resolveConnection({ cwd: currentCwd(), explicit: explicitServer })).then((resolved) => {
+      lastError = void 0;
+      return { server: resolved.server, candidateCount: resolved.candidateCount ?? 1 };
+    }).catch((error) => {
+      connectionPromise = null;
+      noteFailure(error);
+      throw error;
+    });
+    return connectionPromise;
+  }
+  function noteFailure(error) {
+    lastError = error;
+    backoffUntil = now() + rediscoverBackoffMs;
+  }
+  function remember(key, snapshot2) {
+    cache.delete(key);
+    cache.set(key, { snapshot: snapshot2, createdAt: now() });
+    while (cache.size > maxCacheEntries) {
+      cache.delete(cache.keys().next().value);
+    }
+  }
+  function cached(key) {
+    const entry = cache.get(key);
+    if (!entry) return void 0;
+    cache.delete(key);
+    cache.set(key, entry);
+    return entry;
+  }
+  async function fetchSnapshot(server, limits, timeoutMs) {
+    const raw = await transport.evaluate(server, snapshotRequest(limits), { timeoutMs });
+    return toSnapshot(raw, { server });
+  }
+  async function snapshot({ limits, timeoutMs, force = false } = {}) {
+    const normalized = normalizeLimits(limits);
+    const { server } = await connection();
+    const key = `${server}\0${limitsKey(normalized)}`;
+    const entry = cached(key);
+    if (!force && ttlMs > 0 && entry && now() - entry.createdAt <= ttlMs) {
+      return entry.snapshot;
+    }
+    const pending = inFlight.get(key);
+    if (pending) return pending;
+    const promise = fetchSnapshot(server, normalized, timeoutMs ?? defaultTimeoutMs).then((result) => {
+      remember(key, result);
+      return result;
+    }).catch((error) => {
+      if (!(error instanceof SnapshotShapeError)) {
+        connectionPromise = null;
+        noteFailure(error);
+      }
+      throw error;
+    }).finally(() => inFlight.delete(key));
+    inFlight.set(key, promise);
+    return promise;
+  }
+  async function snapshotOrStale({ limits, timeoutMs } = {}) {
+    const normalized = normalizeLimits(limits);
+    let entry;
     try {
-      entries = await readdir(dir, { withFileTypes: true });
+      const { server } = await connection();
+      entry = cached(`${server}\0${limitsKey(normalized)}`);
     } catch {
-      return;
     }
-    for (const entry of entries) {
-      if (sockets.length >= maxSockets) return;
-      const path = join(dir, entry.name);
-      const pathLower = path.toLowerCase();
-      const nameIsNvimish = entry.name.toLowerCase().includes("nvim");
-      const pathIsNvimish = inNvimishDir || nameIsNvimish || pathLower.includes("nvim");
-      if (entry.isSocket?.()) {
-        if (pathIsNvimish) addSocket(path);
-        continue;
+    if (entry && ttlMs > 0 && now() - entry.createdAt <= ttlMs) {
+      return { snapshot: entry.snapshot, stale: false };
+    }
+    const budget = timeoutMs ?? (entry ? staleTimeoutMs ?? defaultTimeoutMs : defaultTimeoutMs);
+    try {
+      return { snapshot: await snapshot({ limits: normalized, timeoutMs: budget, force: true }), stale: false };
+    } catch (error) {
+      if (entry) return { snapshot: entry.snapshot, stale: true, warning: errorToMessage(error) };
+      throw error;
+    }
+  }
+  return {
+    connection,
+    async server() {
+      return (await connection()).server;
+    },
+    snapshot,
+    snapshotOrStale,
+    invalidate({ server = true, cache: clearCache = true } = {}) {
+      if (server) {
+        connectionPromise = null;
+        lastError = void 0;
+        backoffUntil = 0;
       }
-      if (!entry.isDirectory()) {
-        if (!pathIsNvimish) continue;
-        try {
-          if ((await lstat(path)).isSocket()) addSocket(path);
-        } catch {
-        }
-        continue;
-      }
-      if (depth === 0) continue;
-      if (pathIsNvimish) {
-        await walk(path, depth - 1, true);
-      }
+      if (clearCache) cache.clear();
+    },
+    stats() {
+      return { cacheSize: cache.size, inFlight: inFlight.size, backoffUntil };
     }
   };
-  for (const root of roots) {
-    await walk(root, 5, false);
-  }
-  return sockets;
-}
-async function fastCandidates(explicit) {
-  if (explicit) return [explicit];
-  return uniqueStrings([
-    process.env.NVIM,
-    process.env.NVIM_LISTEN_ADDRESS,
-    ...await listServersFromNvim()
-  ]);
-}
-async function probeSummaries(candidates, options = {}) {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (server) => {
-    try {
-      return { server, summary: await getNvimServerSummary(server, { timeoutMs }) };
-    } catch (error) {
-      return { server, error: errorToMessage(error) };
-    }
-  });
-}
-function chooseBestNvimServer(items, cwd) {
-  const best = items.find((item) => item.cwd === cwd) ?? items.find((item) => isInside(cwd, item.currentFile)) ?? items.find((item) => isInside(item.cwd, cwd)) ?? items[0];
-  if (!best) throw new Error("No Neovim server candidates responded");
-  return best;
-}
-async function collectServerSummaries(options = {}) {
-  const explicit = options.explicit;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  const fast = await fastCandidates(explicit);
-  let results = fast.length > 0 ? await probeSummaries(fast, { timeoutMs }) : [];
-  let summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
-  if (!explicit && summaries.length === 0) {
-    const scanned = uniqueStrings((await scanNvimSocketFiles()).filter((s) => !fast.includes(s)));
-    if (scanned.length > 0) {
-      results = [...results, ...await probeSummaries(scanned, { timeoutMs })];
-      summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
-    }
-  }
-  const failures = results.flatMap((r) => r.error ? [`${r.server}: ${r.error}`] : []);
-  return { summaries, failures, candidateCount: summaries.length };
-}
-async function resolveServer(options = {}) {
-  const explicit = options.explicit;
-  if (explicit) return { server: explicit, candidateCount: 1 };
-  const cwd = options.cwd ?? process.cwd();
-  const { summaries, failures, candidateCount } = await collectServerSummaries({
-    timeoutMs: options.timeoutMs
-  });
-  if (summaries.length === 0) {
-    if (failures.length > 0) {
-      throw new Error(`Found Neovim server candidates, but none responded. ${failures.join("; ")}`);
-    }
-    throw new Error(
-      "No Neovim server found. Start Neovim normally, or run `nvim --listen /tmp/nvim-main` and set NVIM_AWARE_SERVER=/tmp/nvim-main."
-    );
-  }
-  const best = chooseBestNvimServer(summaries, cwd);
-  return { server: best.server, summary: best, candidateCount };
 }
 
 // core/format.mjs
@@ -665,6 +861,13 @@ function formatSystemPromptContext(snapshot) {
     "# Live Neovim context",
     "The user may refer to this editor state as 'current file', 'cursor', 'selection', 'quickfix', 'buffers', or 'search'. This is a live snapshot from Neovim at the time of the prompt.",
     ...formatSnapshot(snapshot, { compact: true })
+  ].join("\n");
+}
+function formatOnDemandSystemPromptContext(server) {
+  return [
+    "# Neovim integration",
+    `Neovim is connected (${server}), but editor state is not preloaded to save input tokens.`,
+    "Use the `nvim_context` tool (or run `nvim-context`) if the user's request depends on the current file, cursor, selection, quickfix list/errors/warnings, search register, visible windows, or listed buffers."
   ].join("\n");
 }
 function formatSnapshot(snapshot, options) {
@@ -763,19 +966,22 @@ function nvim_aware_pi_default(pi) {
     type: "string"
   });
   let enabled = false;
-  let choice = null;
-  const explicitServer = () => asNonEmptyString2(pi.getFlag("nvim-server")) ?? getExplicitServer();
-  const ensureConnected = async (ctx) => {
-    const resolved = await resolveServer({ explicit: explicitServer(), cwd: process.cwd() });
-    choice = { server: resolved.server, candidateCount: resolved.candidateCount };
-    if (ctx) {
-      await getCachedNvimSnapshot(resolved.server, {}, { ttlMs: getSnapshotTtlMs() });
-      setNvimStatus(ctx, resolved.candidateCount);
-    }
-    return choice;
+  let session = null;
+  const ensureSession = () => {
+    if (session) return session;
+    const config = readConfig();
+    session = createNvimSession({
+      explicitServer: asNonEmptyString2(pi.getFlag("nvim-server")) ?? config.server,
+      cwd: () => process.cwd(),
+      defaultTimeoutMs: 2e3,
+      ttlMs: config.snapshotTtlMs,
+      staleTimeoutMs: config.promptTimeoutMs
+    });
+    return session;
   };
   pi.on("session_start", async (_event, ctx) => {
-    enabled = pi.getFlag("nvim") === true;
+    const config = readConfig();
+    enabled = pi.getFlag("nvim") === true && !config.disabled;
     const activeTools = pi.getActiveTools();
     if (enabled && !activeTools.includes("nvim_context")) {
       pi.setActiveTools([...activeTools, "nvim_context"]);
@@ -785,8 +991,10 @@ function nvim_aware_pi_default(pi) {
     }
     if (!enabled) return;
     try {
-      await ensureConnected(ctx);
-      ctx.ui.notify(`Connected to Neovim: ${choice?.server}`, "info");
+      const { server, candidateCount } = await ensureSession().connection();
+      await ensureSession().snapshot();
+      setNvimStatus(ctx, candidateCount);
+      ctx.ui.notify(`Connected to Neovim: ${server}`, "info");
     } catch (error) {
       ctx.ui.setStatus("nvim", ctx.ui.theme.fg("warning", "nvim: not connected"));
       ctx.ui.notify(errorToMessage(error), "warning");
@@ -796,9 +1004,9 @@ function nvim_aware_pi_default(pi) {
     description: "Show the live Neovim context Pi sees",
     handler: async (_args, ctx) => {
       try {
-        const selected = choice ?? await ensureConnected(ctx);
-        const snapshot = await getCachedNvimSnapshot(selected.server, {}, { force: true });
-        setNvimStatus(ctx, selected.candidateCount);
+        const active = ensureSession();
+        const snapshot = await active.snapshot({ force: true });
+        setNvimStatus(ctx, (await active.connection()).candidateCount);
         ctx.ui.setWidget("nvim-context", formatSnapshot(snapshot, { compact: false }), {
           placement: "belowEditor"
         });
@@ -825,15 +1033,13 @@ function nvim_aware_pi_default(pi) {
       )
     }),
     async execute(_toolCallId, params) {
-      const selected = choice ?? await ensureConnected();
-      const snapshot = await getCachedNvimSnapshot(
-        selected.server,
-        {
-          surroundingLines: params.includeSurroundingLines === false ? 0 : DEFAULT_SURROUNDING_LINES,
-          maxSelectionBytes: params.maxSelectionBytes ?? DEFAULT_MAX_SELECTION_BYTES
-        },
-        { force: true }
-      );
+      const snapshot = await ensureSession().snapshot({
+        force: true,
+        limits: {
+          surroundingLines: params.includeSurroundingLines === false ? 0 : LIMIT_DEFAULTS.surroundingLines,
+          maxSelectionBytes: params.maxSelectionBytes ?? LIMIT_DEFAULTS.maxSelectionBytes
+        }
+      });
       return {
         content: [{ type: "text", text: formatSnapshot(snapshot, { compact: false }).join("\n") }],
         details: snapshot
@@ -841,21 +1047,24 @@ function nvim_aware_pi_default(pi) {
     }
   });
   pi.on("before_agent_start", async (event, ctx) => {
-    if (!enabled) return;
+    if (!enabled || !session) return;
+    const decision = decideInjection({ prompt: event.prompt ?? "", config: readConfig() });
+    if (decision.kind === "none") return;
     try {
-      const selected = choice ?? await ensureConnected(ctx);
-      const { snapshot, warning } = await getPromptNvimSnapshot(selected.server, {
-        ttlMs: getSnapshotTtlMs(),
-        refreshTimeoutMs: getPromptRefreshTimeoutMs()
-      });
-      setNvimStatus(ctx, selected.candidateCount, warning ? "cached" : "connected");
-      const cacheNote = warning ? `
-- Note: Snapshot refresh failed (${warning}); using cached Neovim context.` : "";
-      return {
-        systemPrompt: `${event.systemPrompt}
+      if (decision.kind === "hint") {
+        const { server, candidateCount } = await session.connection();
+        setNvimStatus(ctx, candidateCount);
+        return { systemPrompt: `${event.systemPrompt}
 
-${formatSystemPromptContext(snapshot)}${cacheNote}`
-      };
+${formatOnDemandSystemPromptContext(server)}` };
+      }
+      const { snapshot, stale, warning } = await session.snapshotOrStale();
+      setNvimStatus(ctx, (await session.connection()).candidateCount, stale ? "cached" : "connected");
+      const note = warning ? `
+- Note: Snapshot refresh failed (${warning}); using cached Neovim context.` : "";
+      return { systemPrompt: `${event.systemPrompt}
+
+${formatSystemPromptContext(snapshot)}${note}` };
     } catch (error) {
       ctx.ui.setStatus("nvim", ctx.ui.theme.fg("warning", "nvim: disconnected"));
       return {

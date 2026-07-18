@@ -1,9 +1,15 @@
 {
   "name": "nvim-aware",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Make AI coding agents (Claude Code, Pi) aware of a running Neovim session. Shared core + thin host adapters.",
-  "keywords": ["claude-code", "claude", "pi", "neovim", "nvim"],
+  "keywords": [
+    "claude-code",
+    "claude",
+    "pi",
+    "neovim",
+    "nvim"
+  ],
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -11,7 +17,8 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "node scripts/build.mjs --check"
+    "check": "node scripts/build.mjs --check",
+    "test": "node scripts/build.mjs --check && node --test test/*.test.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"

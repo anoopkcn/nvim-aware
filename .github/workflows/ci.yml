@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # package.json declares engines.node >= 18, so test the range we claim
+      # rather than only the version that happens to be installed locally.
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      # Runs `build.mjs --check` first: the Claude host executes the vendored
+      # copy under hosts/claude/core/, so committed artifacts drifting from
+      # core/ is a real failure, not a formatting nit.
+      - run: npm test

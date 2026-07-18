@@ -24,7 +24,7 @@ import { accessSync, constants } from "node:fs";
 import { stat } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
 import { createInterface } from "node:readline";
-import { chooseBestNvimServer, collectServerSummaries } from "./discover.mjs";
+import { chooseBestNvimServer, createDiscovery } from "./discovery.mjs";
 import { errorToMessage, safeRealpath } from "./proc.mjs";
 
 export async function runLauncher(config, argv = process.argv.slice(2)) {
@@ -129,10 +129,19 @@ function requireValue(args, index, name) {
 	return value;
 }
 
+/**
+ * The launcher probes even an explicit address, because it wants that
+ * instance's cwd to chdir into — the hosts only want an address, so they skip
+ * the round-trip. Same discovery, different `probeExplicit`.
+ */
 async function selectNvimServer({ name, explicitServer, launchCwd }) {
-	const { summaries, failures } = await collectServerSummaries({ explicit: explicitServer });
+	const { candidates, failures } = await createDiscovery().discover({
+		explicit: explicitServer,
+		cwd: launchCwd,
+		probeExplicit: true,
+	});
 
-	if (summaries.length === 0) {
+	if (candidates.length === 0) {
 		if (explicitServer) {
 			console.error(`${name}: ${explicitServer} did not respond; staying in ${launchCwd}`);
 		} else if (failures.length > 0) {
@@ -141,18 +150,18 @@ async function selectNvimServer({ name, explicitServer, launchCwd }) {
 		return explicitServer ? { server: explicitServer, cwd: undefined } : undefined;
 	}
 	if (explicitServer) {
-		return summaries.find((summary) => summary.server === explicitServer) ?? summaries[0];
+		return candidates.find((candidate) => candidate.server === explicitServer) ?? candidates[0];
 	}
-	if (summaries.length === 1) {
-		return summaries[0];
+	if (candidates.length === 1) {
+		return candidates[0];
 	}
 	if (process.stdin.isTTY && process.stdout.isTTY) {
-		return promptForServer(summaries, launchCwd);
+		return promptForServer(candidates, launchCwd);
 	}
 
-	const selected = chooseBestNvimServer(summaries, launchCwd);
+	const selected = chooseBestNvimServer(candidates, launchCwd);
 	console.error(
-		`${name}: found ${summaries.length} Neovim instances; selected ${basename(selected.cwd) || selected.cwd}. Pass --nvim-server to choose explicitly.`,
+		`${name}: found ${candidates.length} Neovim instances; selected ${basename(selected.cwd) || selected.cwd}. Pass --nvim-server to choose explicitly.`,
 	);
 	return selected;
 }

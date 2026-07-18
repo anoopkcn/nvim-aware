@@ -1,23 +1,13 @@
 #!/usr/bin/env node
 /**
- * UserPromptSubmit hook — decides, per prompt, whether to inject live Neovim
- * editor state, honoring NVIM_AWARE_PROMPT_CONTEXT (auto | full | hint | off).
+ * UserPromptSubmit hook — injects live Neovim state when the turn calls for it.
  *
- *   auto (default): inject a compact snapshot only when the prompt looks like
- *                   it refers to editor state (cheap — nothing otherwise).
- *   full:           inject a compact snapshot on every prompt.
- *   hint:           never inject state; just remind Claude the tool exists.
- *   off:            do nothing.
+ * What "calls for it" means lives in core/injection.mjs, shared with the Pi
+ * host; this file only carries out the decision.
  */
-import {
-	getExplicitServer,
-	getPromptContextMode,
-	getPromptRefreshTimeoutMs,
-	isDisabled,
-	promptLikelyNeedsNvimContext,
-} from "../core/config.mjs";
-import { resolveServer } from "../core/discover.mjs";
-import { getNvimSnapshot } from "../core/snapshot.mjs";
+import { readConfig } from "../core/config.mjs";
+import { decideInjection } from "../core/injection.mjs";
+import { createNvimSession } from "../core/session.mjs";
 import { formatOnDemandSystemPromptContext, formatSystemPromptContext } from "../core/format.mjs";
 import { errorToMessage } from "../core/proc.mjs";
 import { emitContext, readHookInput } from "../lib/hookio.mjs";
@@ -25,39 +15,34 @@ import { emitContext, readHookInput } from "../lib/hookio.mjs";
 const EVENT = "UserPromptSubmit";
 
 async function main() {
-	if (isDisabled()) return;
-
-	const mode = getPromptContextMode();
-	if (mode === "off") return;
+	const config = readConfig();
+	// Exit before touching stdin when no prompt could change the outcome.
+	if (config.disabled || config.promptContextMode === "off") return;
 
 	const input = await readHookInput();
-	const cwd = input.cwd || process.cwd();
-	const prompt = input.prompt || "";
-	const explicit = getExplicitServer();
+	const decision = decideInjection({ prompt: input.prompt ?? "", config });
+	if (decision.kind === "none") return;
 
-	const shouldInject = mode === "full" || (mode === "auto" && promptLikelyNeedsNvimContext(prompt));
+	const session = createNvimSession({
+		explicitServer: config.server,
+		cwd: input.cwd || process.cwd(),
+		defaultTimeoutMs: Math.max(config.promptTimeoutMs, 1500),
+	});
 
-	// hint mode (or auto without a match): at most a lightweight reminder.
-	if (!shouldInject) {
-		if (mode !== "hint") return; // auto, no keyword -> stay silent (no tokens spent)
+	if (decision.kind === "hint") {
 		try {
-			const { server } = await resolveServer({ explicit, cwd });
-			emitContext(EVENT, formatOnDemandSystemPromptContext(server));
+			emitContext(EVENT, formatOnDemandSystemPromptContext(await session.server()));
 		} catch {
 			// No Neovim — say nothing.
 		}
 		return;
 	}
 
-	// shouldInject: fetch and inject a compact live snapshot.
 	try {
-		const { server } = await resolveServer({ explicit, cwd });
-		const timeoutMs = Math.max(getPromptRefreshTimeoutMs(), 1500);
-		const snapshot = await getNvimSnapshot(server, { timeoutMs });
-		emitContext(EVENT, formatSystemPromptContext(snapshot));
+		emitContext(EVENT, formatSystemPromptContext(await session.snapshot()));
 	} catch (error) {
-		// Injection was expected (full mode or the prompt referenced editor state),
-		// so surface a one-line note rather than failing silently.
+		// Injection was expected — either the mode is `full` or the prompt
+		// reached for the editor — so a silent no-op would be misleading.
 		emitContext(EVENT, `Neovim context was requested, but it could not be read: ${errorToMessage(error)}`);
 	}
 }

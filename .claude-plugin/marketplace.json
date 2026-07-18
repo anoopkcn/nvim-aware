@@ -12,7 +12,7 @@
       "name": "nvim-aware-claude",
       "source": "./hosts/claude",
       "description": "Make Claude Code aware of a running Neovim session.",
-      "version": "0.2.0"
+      "version": "0.3.0"
     }
   ]
 }
