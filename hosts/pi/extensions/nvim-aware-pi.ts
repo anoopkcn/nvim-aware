@@ -1,11 +1,13 @@
 /**
  * nvim-aware-pi extension — thin Pi host glue over the shared core.
  *
- * When enabled with `--nvim`, discovers or connects to a running Neovim
- * server, captures the active buffer, cursor, selection, search register,
- * quickfix list, windows, and listed buffers, then injects that live editor
- * context into Pi's system prompt. Also provides an `nvim_context` tool so
- * agents can refresh editor state while working on the user's request.
+ * When enabled with `--nvim`, connects to a running Neovim server and injects
+ * live editor context into Pi's system prompt. Also provides an `nvim_context`
+ * tool so agents can refresh editor state while working on a request.
+ *
+ * Injection is governed by NVIM_AWARE_PROMPT_CONTEXT and NVIM_AWARE_DISABLE,
+ * via the same decision the Claude host uses. Under the default `auto`, a turn
+ * only gets editor state when the prompt reaches for it.
  *
  * This source imports the shared core via relative paths and only works from
  * a checkout of the monorepo. The distributable single-file build lives in
@@ -14,27 +16,19 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 // @ts-ignore -- plain-JS core modules, resolved relative to the repo checkout
-import { getExplicitServer, getPromptRefreshTimeoutMs, getSnapshotTtlMs } from "../../../core/config.mjs";
+import { readConfig } from "../../../core/config.mjs";
 // @ts-ignore
-import { resolveServer } from "../../../core/discover.mjs";
+import { decideInjection } from "../../../core/injection.mjs";
+// @ts-ignore
+import { createNvimSession } from "../../../core/session.mjs";
 // @ts-ignore
 import { errorToMessage } from "../../../core/proc.mjs";
 // @ts-ignore
-import {
-	DEFAULT_MAX_SELECTION_BYTES,
-	DEFAULT_SURROUNDING_LINES,
-	getCachedNvimSnapshot,
-	getPromptNvimSnapshot,
-} from "../../../core/snapshot.mjs";
+import { LIMIT_DEFAULTS } from "../../../core/snapshot.mjs";
 // @ts-ignore
-import { formatSnapshot, formatSystemPromptContext } from "../../../core/format.mjs";
+import { formatOnDemandSystemPromptContext, formatSnapshot, formatSystemPromptContext } from "../../../core/format.mjs";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
-
-type ServerChoice = {
-	server: string;
-	candidateCount: number;
-};
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("nvim", {
@@ -49,25 +43,29 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	let enabled = false;
-	let choice: ServerChoice | null = null;
+	let session: ReturnType<typeof createNvimSession> | null = null;
 
-	const explicitServer = () =>
-		asNonEmptyString(pi.getFlag("nvim-server")) ?? getExplicitServer();
-
-	const ensureConnected = async (ctx?: ExtensionContext): Promise<ServerChoice> => {
-		const resolved = await resolveServer({ explicit: explicitServer(), cwd: process.cwd() });
-		choice = { server: resolved.server, candidateCount: resolved.candidateCount };
-
-		if (ctx) {
-			await getCachedNvimSnapshot(resolved.server, {}, { ttlMs: getSnapshotTtlMs() });
-			setNvimStatus(ctx, resolved.candidateCount);
-		}
-
-		return choice;
+	/**
+	 * Created on demand so `/nvim` and an explicit tool call still work without
+	 * `--nvim`: an explicit request is not automatic injection.
+	 */
+	const ensureSession = () => {
+		if (session) return session;
+		const config = readConfig();
+		session = createNvimSession({
+			explicitServer: asNonEmptyString(pi.getFlag("nvim-server")) ?? config.server,
+			cwd: () => process.cwd(),
+			defaultTimeoutMs: 2000,
+			ttlMs: config.snapshotTtlMs,
+			staleTimeoutMs: config.promptTimeoutMs,
+		});
+		return session;
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		enabled = pi.getFlag("nvim") === true;
+		const config = readConfig();
+		// Two switches: the flag opts in, NVIM_AWARE_DISABLE overrides it.
+		enabled = pi.getFlag("nvim") === true && !config.disabled;
 
 		const activeTools = pi.getActiveTools();
 		if (enabled && !activeTools.includes("nvim_context")) {
@@ -80,8 +78,10 @@ export default function (pi: ExtensionAPI) {
 		if (!enabled) return;
 
 		try {
-			await ensureConnected(ctx);
-			ctx.ui.notify(`Connected to Neovim: ${choice?.server}`, "info");
+			const { server, candidateCount } = await ensureSession().connection();
+			await ensureSession().snapshot(); // warm the cache for the first turn
+			setNvimStatus(ctx, candidateCount);
+			ctx.ui.notify(`Connected to Neovim: ${server}`, "info");
 		} catch (error) {
 			ctx.ui.setStatus("nvim", ctx.ui.theme.fg("warning", "nvim: not connected"));
 			ctx.ui.notify(errorToMessage(error), "warning");
@@ -92,9 +92,9 @@ export default function (pi: ExtensionAPI) {
 		description: "Show the live Neovim context Pi sees",
 		handler: async (_args, ctx) => {
 			try {
-				const selected = choice ?? (await ensureConnected(ctx));
-				const snapshot = await getCachedNvimSnapshot(selected.server, {}, { force: true });
-				setNvimStatus(ctx, selected.candidateCount);
+				const active = ensureSession();
+				const snapshot = await active.snapshot({ force: true });
+				setNvimStatus(ctx, (await active.connection()).candidateCount);
 				ctx.ui.setWidget("nvim-context", formatSnapshot(snapshot, { compact: false }), {
 					placement: "belowEditor",
 				});
@@ -123,15 +123,13 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params) {
-			const selected = choice ?? (await ensureConnected());
-			const snapshot = await getCachedNvimSnapshot(
-				selected.server,
-				{
-					surroundingLines: params.includeSurroundingLines === false ? 0 : DEFAULT_SURROUNDING_LINES,
-					maxSelectionBytes: params.maxSelectionBytes ?? DEFAULT_MAX_SELECTION_BYTES,
+			const snapshot = await ensureSession().snapshot({
+				force: true,
+				limits: {
+					surroundingLines: params.includeSurroundingLines === false ? 0 : LIMIT_DEFAULTS.surroundingLines,
+					maxSelectionBytes: params.maxSelectionBytes ?? LIMIT_DEFAULTS.maxSelectionBytes,
 				},
-				{ force: true },
-			);
+			});
 
 			return {
 				content: [{ type: "text", text: formatSnapshot(snapshot, { compact: false }).join("\n") }],
@@ -141,20 +139,23 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!enabled) return;
+		if (!enabled || !session) return;
+
+		const decision = decideInjection({ prompt: event.prompt ?? "", config: readConfig() });
+		// Under `auto`, a turn that does not reach for the editor costs nothing.
+		if (decision.kind === "none") return;
 
 		try {
-			const selected = choice ?? (await ensureConnected(ctx));
-			const { snapshot, warning } = await getPromptNvimSnapshot(selected.server, {
-				ttlMs: getSnapshotTtlMs(),
-				refreshTimeoutMs: getPromptRefreshTimeoutMs(),
-			});
-			setNvimStatus(ctx, selected.candidateCount, warning ? "cached" : "connected");
-			const cacheNote = warning ? `\n- Note: Snapshot refresh failed (${warning}); using cached Neovim context.` : "";
+			if (decision.kind === "hint") {
+				const { server, candidateCount } = await session.connection();
+				setNvimStatus(ctx, candidateCount);
+				return { systemPrompt: `${event.systemPrompt}\n\n${formatOnDemandSystemPromptContext(server)}` };
+			}
 
-			return {
-				systemPrompt: `${event.systemPrompt}\n\n${formatSystemPromptContext(snapshot)}${cacheNote}`,
-			};
+			const { snapshot, stale, warning } = await session.snapshotOrStale();
+			setNvimStatus(ctx, (await session.connection()).candidateCount, stale ? "cached" : "connected");
+			const note = warning ? `\n- Note: Snapshot refresh failed (${warning}); using cached Neovim context.` : "";
+			return { systemPrompt: `${event.systemPrompt}\n\n${formatSystemPromptContext(snapshot)}${note}` };
 		} catch (error) {
 			ctx.ui.setStatus("nvim", ctx.ui.theme.fg("warning", "nvim: disconnected"));
 			return {

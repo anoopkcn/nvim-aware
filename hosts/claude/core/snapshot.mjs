@@ -8,7 +8,7 @@
  * rather than assumed at each field access.
  */
 import { SNAPSHOT_LUA, SUMMARY_LUA } from "./snapshot-lua.mjs";
-import { errorToMessage, runProcess, vimNumberDict, vimSingleQuoted, DEFAULT_TIMEOUT_MS } from "./proc.mjs";
+import { errorToMessage, vimNumberDict, vimSingleQuoted } from "./proc.mjs";
 
 export const LIMIT_DEFAULTS = Object.freeze({
 	surroundingLines: 5,
@@ -138,71 +138,4 @@ export function toSummary(raw, { server }) {
 		currentFile: parsed.currentFile ?? "",
 		cursor: asPosition(parsed.cursor),
 	};
-}
-
-// ---------------------------------------------------------------------------
-// Fetching. Superseded by core/session.mjs in the next step; kept so the hosts
-// keep running while the seam is introduced.
-// ---------------------------------------------------------------------------
-
-const snapshotCache = new Map();
-const snapshotInFlight = new Map();
-
-function cacheKey(server, limits) {
-	return `${server}\0${limitsKey(limits)}`;
-}
-
-async function evaluate(server, request, timeoutMs) {
-	const result = await runProcess("nvim", ["--server", server, "--remote-expr", request.expression], { timeoutMs });
-	if (result.code !== 0) {
-		throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
-	}
-	return result.stdout.trim() || result.stderr.trim();
-}
-
-export async function getNvimSnapshot(server, options = {}) {
-	const limits = normalizeLimits(options);
-	const raw = await evaluate(server, snapshotRequest(limits), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-	return toSnapshot(raw, { server });
-}
-
-export async function getCachedNvimSnapshot(server, options = {}, cacheOptions = {}) {
-	const limits = normalizeLimits(options);
-	const key = cacheKey(server, limits);
-	const ttlMs = cacheOptions.ttlMs ?? 0;
-	const cached = snapshotCache.get(key);
-	if (!cacheOptions.force && ttlMs > 0 && cached && Date.now() - cached.createdAt <= ttlMs) {
-		return cached.snapshot;
-	}
-
-	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-	const requestKey = `${key}\0${timeoutMs}`;
-	const inFlight = snapshotInFlight.get(requestKey);
-	if (inFlight) return inFlight;
-
-	const promise = getNvimSnapshot(server, { ...limits, timeoutMs })
-		.then((snapshot) => {
-			snapshotCache.set(key, { snapshot, createdAt: Date.now() });
-			return snapshot;
-		})
-		.finally(() => snapshotInFlight.delete(requestKey));
-	snapshotInFlight.set(requestKey, promise);
-	return promise;
-}
-
-export async function getPromptNvimSnapshot(server, { ttlMs, refreshTimeoutMs, options = {} }) {
-	const limits = normalizeLimits(options);
-	const cached = snapshotCache.get(cacheKey(server, limits));
-
-	if (cached && Date.now() - cached.createdAt <= ttlMs) {
-		return { snapshot: cached.snapshot };
-	}
-
-	const timeoutMs = cached ? refreshTimeoutMs : DEFAULT_TIMEOUT_MS;
-	try {
-		return { snapshot: await getCachedNvimSnapshot(server, { ...limits, timeoutMs }, { force: true }) };
-	} catch (error) {
-		if (cached) return { snapshot: cached.snapshot, warning: errorToMessage(error) };
-		throw error;
-	}
 }

@@ -40,30 +40,3 @@ export function readConfig(env = process.env) {
 		disabled: disable !== undefined && !FALSY.has(disable),
 	});
 }
-
-// ---------------------------------------------------------------------------
-// Superseded by readConfig + core/injection.mjs. Kept so the hosts keep running
-// until they are rewritten; removed with the last call site.
-// ---------------------------------------------------------------------------
-
-export function getPromptContextMode() {
-	return readConfig().promptContextMode;
-}
-
-export function getExplicitServer() {
-	return readConfig().server;
-}
-
-export function getSnapshotTtlMs() {
-	return readConfig().snapshotTtlMs;
-}
-
-export function getPromptRefreshTimeoutMs() {
-	return readConfig().promptTimeoutMs;
-}
-
-export function isDisabled() {
-	return readConfig().disabled;
-}
-
-export { promptLikelyNeedsNvimContext } from "./injection.mjs";

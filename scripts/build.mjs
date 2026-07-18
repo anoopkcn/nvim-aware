@@ -106,7 +106,28 @@ try {
 	await rm(wrapperEntry, { force: true });
 }
 
+// Deleting a module from core/ must delete its vendored copy too. Without this
+// the orphan lingers in the plugin, and --check would call the tree in sync
+// because it only ever compares files the build still generates.
+const vendoredCoreDir = join(repoRoot, "hosts/claude/core");
+const orphans = (await readdir(vendoredCoreDir).catch(() => []))
+	.filter((name) => name.endsWith(".mjs"))
+	.map((name) => join(vendoredCoreDir, name))
+	.filter((target) => !outputs.has(target));
+
 let drift = 0;
+
+for (const target of orphans) {
+	const label = relative(repoRoot, target);
+	if (checkOnly) {
+		console.error(`orphaned: ${label}`);
+		drift++;
+		continue;
+	}
+	await rm(target);
+	console.log(`removed ${label}`);
+}
+
 for (const [target, { content, executable }] of outputs) {
 	const label = relative(repoRoot, target);
 	const existing = await readFile(target, "utf8").catch(() => null);
