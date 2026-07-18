@@ -18,7 +18,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "node scripts/build.mjs --check",
-    "test": "node scripts/build.mjs --check && node --test \"test/**/*.test.mjs\""
+    "test": "node scripts/build.mjs --check && node --test test/*.test.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"
