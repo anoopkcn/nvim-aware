@@ -165,11 +165,6 @@ export async function getNvimSnapshot(server, options = {}) {
 	return toSnapshot(raw, { server });
 }
 
-export async function getNvimServerSummary(server, options = {}) {
-	const raw = await evaluate(server, summaryRequest(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-	return toSummary(raw, { server });
-}
-
 export async function getCachedNvimSnapshot(server, options = {}, cacheOptions = {}) {
 	const limits = normalizeLimits(options);
 	const key = cacheKey(server, limits);

@@ -125,11 +125,6 @@ function getPromptRefreshTimeoutMs() {
   return readEnvMs("NVIM_AWARE_PROMPT_TIMEOUT_MS", 800);
 }
 
-// core/discover.mjs
-import { lstat, readdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 // core/snapshot-lua.mjs
 var SUMMARY_LUA = String.raw`
 (function()
@@ -549,10 +544,6 @@ async function getNvimSnapshot(server, options = {}) {
   const raw = await evaluate(server, snapshotRequest(limits), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   return toSnapshot(raw, { server });
 }
-async function getNvimServerSummary(server, options = {}) {
-  const raw = await evaluate(server, summaryRequest(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  return toSummary(raw, { server });
-}
 async function getCachedNvimSnapshot(server, options = {}, cacheOptions = {}) {
   const limits = normalizeLimits(options);
   const key = cacheKey(server, limits);
@@ -587,90 +578,99 @@ async function getPromptNvimSnapshot(server, { ttlMs, refreshTimeoutMs, options 
   }
 }
 
+// core/transport.mjs
+import { lstat, readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+var DEFAULT_LIST_TIMEOUT_MS = 1500;
+var MAX_SOCKETS = 3e3;
+var SOCKET_SCAN_DEPTH = 5;
+function createSpawnTransport({ run = runProcess, env = process.env, platform = process.platform } = {}) {
+  return {
+    async evaluate(server, request, options = {}) {
+      const result = await run("nvim", ["--server", server, "--remote-expr", request.expression], {
+        timeoutMs: options.timeoutMs
+      });
+      if (result.code !== 0) {
+        throw new Error(`nvim --remote-expr failed: ${result.stderr.trim() || result.stdout.trim()}`);
+      }
+      return result.stdout.trim() || result.stderr.trim();
+    },
+    /** Ask a throwaway headless Neovim which servers are running. Never throws. */
+    async listServers(options = {}) {
+      try {
+        const result = await run(
+          "nvim",
+          ["--headless", "--clean", "-n", "+echo json_encode({'self': v:servername, 'servers': serverlist()})", "+qa"],
+          { timeoutMs: options.timeoutMs ?? DEFAULT_LIST_TIMEOUT_MS }
+        );
+        const parsed = parseFirstJsonObject(result.stdout + result.stderr);
+        if (!Array.isArray(parsed?.servers)) return [];
+        return parsed.servers.filter((server) => typeof server === "string" && server && server !== parsed.self);
+      } catch {
+        return [];
+      }
+    },
+    /** Scan likely runtime directories for Neovim-looking unix sockets. Never throws. */
+    async scanSocketFiles() {
+      if (platform === "win32") return [];
+      const roots = uniqueExistingRealpaths([env.XDG_RUNTIME_DIR, env.TMPDIR, tmpdir(), "/tmp"]);
+      const sockets = [];
+      const seen = /* @__PURE__ */ new Set();
+      const addSocket = (path) => {
+        if (seen.has(path)) return;
+        seen.add(path);
+        sockets.push(path);
+      };
+      const walk = async (dir, depth, inNvimishDir) => {
+        if (depth < 0 || sockets.length >= MAX_SOCKETS) return;
+        let entries;
+        try {
+          entries = await readdir(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          if (sockets.length >= MAX_SOCKETS) return;
+          const path = join(dir, entry.name);
+          const nameIsNvimish = entry.name.toLowerCase().includes("nvim");
+          const pathIsNvimish = inNvimishDir || nameIsNvimish || path.toLowerCase().includes("nvim");
+          if (entry.isSocket?.()) {
+            if (pathIsNvimish) addSocket(path);
+            continue;
+          }
+          if (!entry.isDirectory()) {
+            if (!pathIsNvimish) continue;
+            try {
+              if ((await lstat(path)).isSocket()) addSocket(path);
+            } catch {
+            }
+            continue;
+          }
+          if (depth === 0) continue;
+          if (pathIsNvimish) await walk(path, depth - 1, true);
+        }
+      };
+      for (const root of roots) {
+        await walk(root, SOCKET_SCAN_DEPTH, false);
+      }
+      return sockets;
+    }
+  };
+}
+
 // core/discover.mjs
 var PROBE_CONCURRENCY = 4;
 var DEFAULT_PROBE_TIMEOUT_MS = 1200;
-async function listServersFromNvim() {
-  try {
-    const result = await runProcess(
-      "nvim",
-      [
-        "--headless",
-        "--clean",
-        "-n",
-        "+echo json_encode({'self': v:servername, 'servers': serverlist()})",
-        "+qa"
-      ],
-      { timeoutMs: 1500 }
-    );
-    const parsed = parseFirstJsonObject(result.stdout + result.stderr);
-    if (!parsed?.servers || !Array.isArray(parsed.servers)) return [];
-    return parsed.servers.filter((server) => typeof server === "string" && server && server !== parsed.self);
-  } catch {
-    return [];
-  }
-}
-async function scanNvimSocketFiles() {
-  if (process.platform === "win32") return [];
-  const roots = uniqueExistingRealpaths([process.env.XDG_RUNTIME_DIR, process.env.TMPDIR, tmpdir(), "/tmp"]);
-  const sockets = [];
-  const seen = /* @__PURE__ */ new Set();
-  const maxSockets = 3e3;
-  const addSocket = (path) => {
-    if (seen.has(path)) return;
-    seen.add(path);
-    sockets.push(path);
-  };
-  const walk = async (dir, depth, inNvimishDir) => {
-    if (depth < 0 || sockets.length >= maxSockets) return;
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (sockets.length >= maxSockets) return;
-      const path = join(dir, entry.name);
-      const pathLower = path.toLowerCase();
-      const nameIsNvimish = entry.name.toLowerCase().includes("nvim");
-      const pathIsNvimish = inNvimishDir || nameIsNvimish || pathLower.includes("nvim");
-      if (entry.isSocket?.()) {
-        if (pathIsNvimish) addSocket(path);
-        continue;
-      }
-      if (!entry.isDirectory()) {
-        if (!pathIsNvimish) continue;
-        try {
-          if ((await lstat(path)).isSocket()) addSocket(path);
-        } catch {
-        }
-        continue;
-      }
-      if (depth === 0) continue;
-      if (pathIsNvimish) {
-        await walk(path, depth - 1, true);
-      }
-    }
-  };
-  for (const root of roots) {
-    await walk(root, 5, false);
-  }
-  return sockets;
-}
-async function fastCandidates(explicit) {
+async function fastCandidates(explicit, transport, env) {
   if (explicit) return [explicit];
-  return uniqueStrings([
-    process.env.NVIM,
-    process.env.NVIM_LISTEN_ADDRESS,
-    ...await listServersFromNvim()
-  ]);
+  return uniqueStrings([env.NVIM, env.NVIM_LISTEN_ADDRESS, ...await transport.listServers()]);
 }
-async function probeSummaries(candidates, options = {}) {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+async function probeSummaries(candidates, { transport, timeoutMs }) {
   return mapWithConcurrency(candidates, PROBE_CONCURRENCY, async (server) => {
     try {
-      return { server, summary: await getNvimServerSummary(server, { timeoutMs }) };
+      const raw = await transport.evaluate(server, summaryRequest(), { timeoutMs });
+      return { server, summary: toSummary(raw, { server }) };
     } catch (error) {
       return { server, error: errorToMessage(error) };
     }
@@ -682,15 +682,17 @@ function chooseBestNvimServer(items, cwd) {
   return best;
 }
 async function collectServerSummaries(options = {}) {
+  const transport = options.transport ?? createSpawnTransport();
+  const env = options.env ?? process.env;
   const explicit = options.explicit;
   const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  const fast = await fastCandidates(explicit);
-  let results = fast.length > 0 ? await probeSummaries(fast, { timeoutMs }) : [];
+  const fast = await fastCandidates(explicit, transport, env);
+  let results = fast.length > 0 ? await probeSummaries(fast, { transport, timeoutMs }) : [];
   let summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
   if (!explicit && summaries.length === 0) {
-    const scanned = uniqueStrings((await scanNvimSocketFiles()).filter((s) => !fast.includes(s)));
+    const scanned = uniqueStrings((await transport.scanSocketFiles()).filter((s) => !fast.includes(s)));
     if (scanned.length > 0) {
-      results = [...results, ...await probeSummaries(scanned, { timeoutMs })];
+      results = [...results, ...await probeSummaries(scanned, { transport, timeoutMs })];
       summaries = results.flatMap((r) => r.summary ? [r.summary] : []);
     }
   }
@@ -702,6 +704,8 @@ async function resolveServer(options = {}) {
   if (explicit) return { server: explicit, candidateCount: 1 };
   const cwd = options.cwd ?? process.cwd();
   const { summaries, failures, candidateCount } = await collectServerSummaries({
+    transport: options.transport,
+    env: options.env,
     timeoutMs: options.timeoutMs
   });
   if (summaries.length === 0) {
