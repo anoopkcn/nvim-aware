@@ -7,9 +7,8 @@
  *
  * Usage: nvim-context [--server <addr>] [--format text|json]
  */
-import { getExplicitServer } from "../core/config.mjs";
-import { resolveServer } from "../core/discover.mjs";
-import { getNvimSnapshot } from "../core/snapshot.mjs";
+import { readConfig } from "../core/config.mjs";
+import { createNvimSession } from "../core/session.mjs";
 import { formatSnapshot } from "../core/format.mjs";
 import { errorToMessage } from "../core/proc.mjs";
 
@@ -39,17 +38,23 @@ async function main() {
 		return;
 	}
 
-	const explicit = opts.server || getExplicitServer();
+	const config = readConfig();
+	const session = createNvimSession({
+		explicitServer: opts.server || config.server,
+		cwd: process.cwd(),
+		defaultTimeoutMs: 2000,
+	});
+
 	let server;
 	try {
-		({ server } = await resolveServer({ explicit, cwd: process.cwd() }));
+		server = await session.server();
 	} catch (error) {
 		process.stderr.write(`${errorToMessage(error)}\n`);
 		process.exit(1);
 	}
 
 	try {
-		const snapshot = await getNvimSnapshot(server, { timeoutMs: 2000 });
+		const snapshot = await session.snapshot();
 		if (opts.format === "json") {
 			process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
 		} else {

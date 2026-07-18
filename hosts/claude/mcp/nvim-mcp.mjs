@@ -7,16 +7,10 @@
  *
  * Claude sees the tool as `mcp__nvim-aware__nvim_context`.
  */
-import { getExplicitServer, getSnapshotTtlMs } from "../core/config.mjs";
-import { resolveServer } from "../core/discover.mjs";
+import { readConfig } from "../core/config.mjs";
 import { errorToMessage } from "../core/proc.mjs";
-import {
-	DEFAULT_MAX_BUFFERS,
-	DEFAULT_MAX_QUICKFIX_ITEMS,
-	DEFAULT_MAX_SELECTION_BYTES,
-	DEFAULT_SURROUNDING_LINES,
-	getCachedNvimSnapshot,
-} from "../core/snapshot.mjs";
+import { createNvimSession } from "../core/session.mjs";
+import { LIMIT_DEFAULTS } from "../core/snapshot.mjs";
 import { formatSnapshot } from "../core/format.mjs";
 
 const SERVER_INFO = { name: "nvim-aware", version: "0.2.0" };
@@ -52,32 +46,28 @@ const TOOL = {
 	},
 };
 
-// Remember the resolved server across calls; clear it if a call fails.
-let choice = null;
-
-async function ensureServer() {
-	if (choice) return choice;
-	const explicit = getExplicitServer();
-	const resolved = await resolveServer({ explicit, cwd: process.cwd() });
-	choice = resolved.server;
-	return choice;
-}
+// One session for the life of the server. It owns the resolved address, the
+// TTL cache, and the decision to drop that address after a failure.
+const config = readConfig();
+const session = createNvimSession({
+	explicitServer: config.server,
+	cwd: () => process.cwd(),
+	defaultTimeoutMs: 2000,
+	ttlMs: config.snapshotTtlMs,
+});
 
 async function runNvimContext(params = {}) {
-	const options = {
-		surroundingLines: params.includeSurroundingLines === false ? 0 : DEFAULT_SURROUNDING_LINES,
-		maxSelectionBytes: params.maxSelectionBytes ?? DEFAULT_MAX_SELECTION_BYTES,
-		maxBuffers: params.maxBuffers ?? DEFAULT_MAX_BUFFERS,
-		maxQuickfixItems: params.maxQuickfixItems ?? DEFAULT_MAX_QUICKFIX_ITEMS,
+	const limits = {
+		surroundingLines: params.includeSurroundingLines === false ? 0 : LIMIT_DEFAULTS.surroundingLines,
+		maxSelectionBytes: params.maxSelectionBytes ?? LIMIT_DEFAULTS.maxSelectionBytes,
+		maxBuffers: params.maxBuffers ?? LIMIT_DEFAULTS.maxBuffers,
+		maxQuickfixItems: params.maxQuickfixItems ?? LIMIT_DEFAULTS.maxQuickfixItems,
 	};
 
 	try {
-		const server = await ensureServer();
-		const snapshot = await getCachedNvimSnapshot(server, options, { ttlMs: getSnapshotTtlMs() });
-		const text = formatSnapshot(snapshot, { compact: false }).join("\n");
-		return { content: [{ type: "text", text }] };
+		const snapshot = await session.snapshot({ limits });
+		return { content: [{ type: "text", text: formatSnapshot(snapshot, { compact: false }).join("\n") }] };
 	} catch (error) {
-		choice = null; // force re-resolution next time
 		return { content: [{ type: "text", text: `Neovim context unavailable: ${errorToMessage(error)}` }], isError: true };
 	}
 }
